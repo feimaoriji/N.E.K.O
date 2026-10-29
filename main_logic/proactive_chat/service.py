@@ -115,6 +115,7 @@ from main_logic.proactive_chat.mini_game_invite import (
     _pick_mini_game_type,
 )
 from main_logic.proactive_chat.music_recommendation import (
+    _build_ambient_context_hint,
     _build_music_dynamic_context,
     _build_music_playing_hint,
     _select_music_recommendation,
@@ -2372,6 +2373,27 @@ async def handle_proactive_chat(
             master_name=master_name_current,
             lang=proactive_lang,
         )
+        # Ambient snapshots pushed by plugins (context_type="ambient") ride the
+        # same trailing free-text slot as the playback hint: it is appended to
+        # the end of the Phase 2 prompt, so this adds no prompt parameter and no
+        # frontend switch. Empty when no plugin published anything (or all
+        # snapshots expired), which keeps the prompt byte-identical to before.
+        ambient_hint = _build_ambient_context_hint(
+            mgr=mgr,
+            master_name=master_name_current,
+            lang=proactive_lang,
+        )
+        if ambient_hint:
+            logger.info(
+                "[%s] ambient context 注入自主搭话 prompt：%s",
+                lanlan_name,
+                ambient_hint[:200],
+            )
+            music_playing_hint = (
+                f"{music_playing_hint}\n\n{ambient_hint}"
+                if music_playing_hint
+                else ambient_hint
+            )
 
         # Render activity snapshot as prompt; absent snapshot yields empty string, making decision-frame
         # A) current-state branch default to other states with all entry points available.

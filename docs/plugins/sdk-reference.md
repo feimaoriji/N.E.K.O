@@ -164,6 +164,68 @@ The v1 fields (`message_type`, `content`, `delivery`, `reply`, and the other leg
 - Audio and video message parts are not currently delivered by the host. Do not report them as successfully played or shown.
 - A Hosted UI panel can render user-facing audio or video itself, but that does not deliver media through the native chat or model channel.
 
+#### Ambient context (background snapshots)
+
+Some plugins know something about the world that is not a message: which track is
+playing, what level the game is on, what the weather is. Sending that as an
+ordinary message either buries it in the conversation queue (`read`) or forces
+her to speak (`respond`). Ambient context is the third option — a *fact* the host
+may use when it decides to talk, never a turn.
+
+The contract is `ai_behavior="blind"` plus two metadata keys:
+
+```python
+result = self.push_message(
+    source="now_playing",
+    visibility=[],                     # nobody sees it verbatim
+    ai_behavior="blind",               # never a turn, never a render
+    parts=[{"type": "text", "text": "播放中：《晴天》— 周杰伦"}],
+    metadata={
+        "context_type": "ambient",
+        "ambient": {
+            "provider": "now_playing", # stable per data source
+            "text": "播放中：《晴天》— 周杰伦",  # the fact, in her language
+            "data": {"title": "晴天", "artist": "周杰伦"},
+            "ttl_s": 30,
+            "priority": 0,
+        },
+    },
+)
+```
+
+`metadata.ambient` fields:
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `provider` | `str` | yes | ≤ 32 chars, `a-z0-9_` only. One live snapshot per provider: a new push from the same provider **replaces** the previous one. |
+| `text` | `str` | yes | The line she may see. Whitespace is collapsed and the text is truncated to 500 chars. Falls back to the event's `summary` / `detail` when absent, but set it explicitly. |
+| `data` | `object` | no | Structured extras for your own UI/logs. Non-object values are dropped (`{}`). |
+| `ttl_s` | `number` | no | Default `30`. Clamped to `[1, 3600]`. Past its TTL the snapshot is gone — a stale "now playing" is worse than none. |
+| `priority` | `int` | no | Default `0`, clamped to `[-100, 100]`. Higher renders first when several providers are live. |
+
+Host-side bounds: at most 16 providers are kept (the oldest entry is evicted
+first), and the rendered prompt block is capped at 1200 chars — whole entries are
+dropped at the limit, never half of one.
+
+Three behaviours worth designing around:
+
+1. **A snapshot never enters the model as a turn and never makes her speak.** It
+   skips the callback queue, the conversation history, and the chat/HUD render; it
+   only decorates the next proactive turn's prompt while it is fresh. Pushing once
+   per state change is enough — there is no need to re-push on a timer unless the
+   TTL has run out.
+2. **Older hosts ignore it.** `blind` maps to `delivery_mode="silent"` there, so
+   nothing breaks and nothing appears. Because that also means the text is
+   invisible on old versions, keep a normal `ai_behavior="read"` push for anything
+   the user must be told in the conversation, and treat ambient as an optional
+   enrichment on top of it.
+3. **Whether and when she speaks is entirely the host's decision.** Ambient
+   context never triggers a turn; the host's proactive scheduler decides. Do not
+   build timing assumptions into your plugin beyond `ttl_s`.
+
+Malformed ambient metadata (no `provider`, invalid provider name, non-object
+`ambient`) is dropped with a warning and never falls through into the chat path.
+
 #### `data_path(*parts) -> Path`
 
 Get a path under the plugin's `data/` directory.

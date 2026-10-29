@@ -54,6 +54,15 @@ import main_logic.core as _core_facade
 from uuid import uuid4
 from ._shared import (
     _VOICE_PROACTIVE_ACK_GRACE_S,
+    _AMBIENT_MAX_PROVIDERS,
+    _AMBIENT_PRIORITY_MAX,
+    _AMBIENT_PRIORITY_MIN,
+    _AMBIENT_PROVIDER_CHARS,
+    _AMBIENT_PROVIDER_MAX_LEN,
+    _AMBIENT_TEXT_MAX_LEN,
+    _AMBIENT_TTL_DEFAULT_S,
+    _AMBIENT_TTL_MAX_S,
+    _AMBIENT_TTL_MIN_S,
     logger,
     _proactive_expected_sid,
     FreshScreenshot,
@@ -3703,6 +3712,156 @@ class ProactiveMixin:
         except Exception:
             # Pruning is best-effort housekeeping — never let it break callback bookkeeping.
             pass
+
+    # ── Ambient context (out-of-band background snapshots) ───────────────
+    def _ambient_context_store(self) -> dict:
+        """Return the provider→entry snapshot store, creating it on first use.
+
+        Created lazily rather than assigned in ``LLMSessionManager.__init__``
+        because this channel is additive: managers built by test doubles
+        (``__new__`` plus a handful of attributes) must keep working, and every
+        reader already tolerates a missing store.
+        """
+        store = getattr(self, "_ambient_context", None)
+        if not isinstance(store, dict):
+            store = {}
+            self._ambient_context = store
+        return store
+
+    def note_ambient_context(
+        self,
+        provider,
+        *,
+        text: str = "",
+        data=None,
+        ttl_s: float = _AMBIENT_TTL_DEFAULT_S,
+        priority=0,
+    ) -> bool:
+        """Record one ambient snapshot; the SAME provider replaces the previous one.
+
+        Deliberately not a queue: a snapshot states "the world right now", so two
+        pushes from one provider are the same fact twice, not two facts. Queueing
+        them would re-inject a stale song/level on the next user turn, which is
+        exactly what this channel exists to avoid.
+
+        Returns whether the snapshot was accepted. Invalid input is rejected
+        (never raised) because the caller is the plugin event handler and must
+        not die on plugin-authored data.
+        """
+        try:
+            if not isinstance(provider, str):
+                return False
+            if not provider or len(provider) > _AMBIENT_PROVIDER_MAX_LEN:
+                return False
+            for char in provider:
+                if char not in _AMBIENT_PROVIDER_CHARS:
+                    return False
+            body = (
+                " ".join(text.split())[:_AMBIENT_TEXT_MAX_LEN]
+                if isinstance(text, str)
+                else ""
+            )
+            payload = dict(data) if isinstance(data, dict) else {}
+            try:
+                ttl = float(ttl_s)
+            except (TypeError, ValueError):
+                ttl = _AMBIENT_TTL_DEFAULT_S
+            if ttl != ttl:  # NaN — every comparison below would be False.
+                ttl = _AMBIENT_TTL_DEFAULT_S
+            ttl = max(_AMBIENT_TTL_MIN_S, min(_AMBIENT_TTL_MAX_S, ttl))
+            try:
+                prio = int(priority or 0)
+            except (TypeError, ValueError, OverflowError):
+                prio = 0
+            prio = max(_AMBIENT_PRIORITY_MIN, min(_AMBIENT_PRIORITY_MAX, prio))
+            store = self._ambient_context_store()
+            # Single-key dict assignment is atomic under the GIL, which is why
+            # this store needs no lock: no reader iterates-and-mutates it and
+            # both sides only ever touch one key at a time.
+            store[provider] = {
+                "provider": provider,
+                "text": body,
+                "data": payload,
+                "ts": time.monotonic(),
+                "ttl_s": ttl,
+                "priority": prio,
+            }
+            overflow = len(store) - _AMBIENT_MAX_PROVIDERS
+            if overflow > 0:
+                # Oldest first, never the entry just written: a plugin spraying
+                # provider names must not be able to evict a fresh fact.
+                oldest = sorted(
+                    (key for key in store if key != provider),
+                    key=lambda key: store[key]["ts"],
+                )
+                for key in oldest[:overflow]:
+                    store.pop(key, None)
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] note_ambient_context failed: %s",
+                getattr(self, "lanlan_name", "?"),
+                e,
+            )
+            return False
+
+    def get_ambient_contexts(self, *, max_age_s=None) -> list[dict]:
+        """Return fresh ambient snapshots, ordered by ``(-priority, provider)``.
+
+        Freshness is each entry's own ``ttl_s`` — a snapshot past its TTL
+        describes a world that may no longer exist — and ``max_age_s``, when
+        given, narrows the window further for callers that want less history.
+        The sort key is total and stable so the rendered block does not shuffle
+        between two turns taken milliseconds apart.
+
+        Returns copies: callers must not be able to mutate delivery state. Any
+        failure yields ``[]`` — this only feeds a prompt hint, and a hint must
+        never be able to take proactive chat down.
+        """
+        try:
+            store = getattr(self, "_ambient_context", None)
+            if not isinstance(store, dict) or not store:
+                return []
+            now = time.monotonic()
+            max_age = None
+            if isinstance(max_age_s, (int, float)) and not isinstance(max_age_s, bool):
+                max_age = float(max_age_s)
+            fresh: list[dict] = []
+            for entry in list(store.values()):
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    age = now - float(entry.get("ts") or 0.0)
+                    ttl = float(entry.get("ttl_s") or 0.0)
+                    prio = int(entry.get("priority") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not age < ttl:
+                    continue
+                if max_age is not None and not age < max_age:
+                    continue
+                data = entry.get("data")
+                fresh.append(
+                    {
+                        "provider": entry.get("provider"),
+                        "text": entry.get("text") or "",
+                        "data": dict(data) if isinstance(data, dict) else {},
+                        "ts": entry.get("ts"),
+                        "ttl_s": ttl,
+                        "priority": prio,
+                    }
+                )
+            fresh.sort(
+                key=lambda item: (-item["priority"], str(item["provider"] or ""))
+            )
+            return fresh
+        except Exception as e:
+            logger.debug(
+                "[%s] get_ambient_contexts failed: %s",
+                getattr(self, "lanlan_name", "?"),
+                e,
+            )
+            return []
 
     def _claim_agent_callbacks_for_llm(self) -> list:
         """Select and fence the exact callback snapshot for one text prompt.

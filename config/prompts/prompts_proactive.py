@@ -4465,6 +4465,83 @@ def get_proactive_music_strict_constraint(lang: str = "zh") -> str:
     )
 
 
+# ---------- Ambient context (plugin background snapshots) ----------
+# Free text a plugin handed the host about the outside world ("this song is
+# playing", "the game is at act 2"). It is a BACKGROUND FACT, not something the
+# user said, so the wording has to say both things: do not force it into the
+# conversation, and do not answer it as if it were a turn.
+PROACTIVE_AMBIENT_CONTEXT_HEADER = {
+    "zh": "环境已知信息（背景事实，不必刻意提及，也不要当成用户刚说的话）：",
+    "zh-TW": "環境已知資訊（背景事實，不必刻意提及，也不要當成使用者剛說的話）：",
+    "en": "Known ambient context (background facts; no need to bring them up, and do not treat them as something the user just said):",
+    "ja": "環境の既知情報（背景の事実であり、無理に話題に出す必要はありません。また、ユーザーが今話したこととして扱わないでください）：",
+    "ko": "환경 기지 정보(배경 사실이며, 굳이 언급할 필요는 없고 사용자가 방금 한 말로 취급하지 마십시오):",
+    "ru": "Известный контекст окружения (фоновые факты; не нужно специально их упоминать и не относись к ним как к тому, что пользователь только что сказал):",
+    "es": "Contexto ambiental conocido (hechos de fondo; no hace falta mencionarlos y no los trates como algo que el usuario acaba de decir):",
+    "pt": "Contexto ambiente conhecido (fatos de fundo; não é preciso mencioná-los e não os trate como algo que o usuário acabou de dizer):",
+}
+
+# Keep the whole block small: it is appended to an already-large Phase 2
+# prompt, and plugins can (in principle) supply several providers at once.
+PROACTIVE_AMBIENT_CONTEXT_MAX_CHARS = 1200
+
+
+def get_proactive_ambient_context_hint(
+    entries: list[dict], master_name: str | None = None, lang: str = "zh"
+) -> str:
+    """
+    Render ambient snapshots (``LLMSessionManager.get_ambient_contexts()``) as a
+    trailing block for the Phase 2 proactive prompt.
+
+    Kept deliberately free-form rather than a numbered section: it lands in the
+    existing ``music_playing_hint`` slot, which callers append to the end of the
+    prompt without registering a new prompt parameter.
+
+    ``master_name`` is accepted for signature parity with the sibling hint
+    builders and for templates that may grow a ``{master}`` placeholder later;
+    the current headers do not use it.
+
+    Every entry text goes through ``_escape_format_braces()``: the return value
+    is spliced into a prompt that is later run through ``.format()``, so a
+    bracketed title (a song literally named ``{title}``) would otherwise raise
+    KeyError there. Same contract as ``get_proactive_music_playing_hint``
+    (Codex review #1043).
+    """  # noqa: DOCSTRING_CJK
+    lang_key = _normalize_prompt_language(lang)
+    header = PROACTIVE_AMBIENT_CONTEXT_HEADER.get(
+        lang_key,
+        PROACTIVE_AMBIENT_CONTEXT_HEADER.get("en", PROACTIVE_AMBIENT_CONTEXT_HEADER["zh"]),
+    )
+    if not isinstance(entries, list):
+        return ""
+
+    lines: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get("text")
+        if not isinstance(text, str):
+            continue
+        clean = " ".join(text.split())
+        if not clean:
+            continue
+        lines.append("- " + _escape_format_braces(clean))
+    if not lines:
+        return ""
+
+    # Fill until the budget is spent, dropping whole entries (never half of one)
+    # so the model never reads a truncated fact as complete.
+    block = header
+    for line in lines:
+        candidate = f"{block}\n{line}"
+        if len(candidate) > PROACTIVE_AMBIENT_CONTEXT_MAX_CHARS:
+            break
+        block = candidate
+    if block == header:
+        return ""
+    return block
+
+
 # ======
 # ====== Reunion greetings on first connection / character switching ======
 # ======

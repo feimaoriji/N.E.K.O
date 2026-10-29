@@ -79,6 +79,22 @@ _CONTEXT_APPEND_BARE_PRIME_SOURCES = frozenset({
 })
 
 
+# ── Ambient context (out-of-band background snapshots) ────────────────────
+# A plugin can hand the host a snapshot of the outside world (currently
+# playing track, game state, weather) instead of a conversation event. The host
+# keeps at most one entry per provider and bounds every dimension, so a
+# misbehaving plugin cannot grow the manager's memory or the Phase 2 prompt.
+_AMBIENT_PROVIDER_MAX_LEN = 32
+_AMBIENT_PROVIDER_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+_AMBIENT_MAX_PROVIDERS = 16
+_AMBIENT_TEXT_MAX_LEN = 500
+_AMBIENT_TTL_DEFAULT_S = 30.0
+_AMBIENT_TTL_MIN_S = 1.0
+_AMBIENT_TTL_MAX_S = 3600.0
+_AMBIENT_PRIORITY_MIN = -100
+_AMBIENT_PRIORITY_MAX = 100
+
+
 _VOICE_ECHO_LOOKBACK_SECONDS = 20.0
 _VOICE_ECHO_LOOKBACK_CHARS = 1200
 _VOICE_ECHO_MIN_NORMALIZED_CHARS = 6

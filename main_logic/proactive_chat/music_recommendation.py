@@ -22,6 +22,7 @@ from functools import partial
 from config.prompts.prompts_proactive import (
     MUSIC_SEARCH_RESULT_TEXTS,
     PROACTIVE_MUSIC_TAG_INSTRUCTIONS,
+    get_proactive_ambient_context_hint,
     get_proactive_music_failsafe_hint,
     get_proactive_music_playing_hint,
     get_proactive_music_strict_constraint,
@@ -231,6 +232,31 @@ def _build_music_playing_hint(
         lang
     )
     return get_proactive_music_playing_hint(track_name, master_name, lang)
+
+
+def _build_ambient_context_hint(*, mgr, master_name: str, lang: str) -> str:
+    """Render the manager's ambient snapshots for the proactive prompt.
+
+    Purely additive: a manager without ``get_ambient_contexts`` (an older host,
+    or a test double that only stubs what its own test needs) yields ``""``,
+    and every failure is swallowed for the same reason the manager's own reader
+    swallows them — this is a hint, never a gate on whether she may speak.
+    """
+    getter = getattr(mgr, "get_ambient_contexts", None)
+    if not callable(getter):
+        return ""
+    try:
+        entries = getter()
+    except Exception as exc:
+        logger.debug("[ambient] snapshot read failed: %s", exc)
+        return ""
+    if not entries:
+        return ""
+    try:
+        return get_proactive_ambient_context_hint(entries, master_name, lang)
+    except Exception as exc:
+        logger.debug("[ambient] hint render failed: %s", exc)
+        return ""
 
 
 def _build_music_dynamic_context(

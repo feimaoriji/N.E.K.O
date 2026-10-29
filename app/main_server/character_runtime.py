@@ -1520,6 +1520,82 @@ async def _handle_agent_event(event: dict):
                     if isinstance(event.get("metadata"), dict)
                     else {}
                 )
+                # ── Ambient context (plugin → host background facts) ──────
+                # A plugin may declare ``metadata.context_type == "ambient"``
+                # to hand the host a snapshot of the outside world ("this song
+                # is playing", "the game is at act 2") that should inform the
+                # PROACTIVE prompt without ever becoming a conversation event.
+                # There was no channel for that: ``read`` drops a callback into
+                # the queue (stale snapshots then re-inject on the next user
+                # turn) and ``respond`` forces her to speak. This one does
+                # neither.
+                #
+                # The contract rides on ai_behavior="blind" on purpose: an OLD
+                # host maps blind→delivery_mode="silent" and ignores the event
+                # entirely, so the same plugin is safe against both. Here, on a
+                # new host, the snapshot is taken out of the event flow before
+                # any of it is built: no callback, no queue entry, no proactive
+                # submit, no frontend render. Malformed ambient metadata is
+                # dropped the same way — a broken snapshot must not fall through
+                # into the ordinary callback path and surface as a chat event.
+                if event_metadata.get("context_type") == "ambient":
+                    _ambient_payload = event_metadata.get("ambient")
+                    if not isinstance(_ambient_payload, dict):
+                        logger.warning(
+                            "[EventBus] ambient context 丢弃: metadata.ambient 不是 dict (lanlan=%s)",
+                            lanlan,
+                        )
+                        return
+                    _note_ambient = getattr(mgr, "note_ambient_context", None)
+                    if not callable(_note_ambient):
+                        logger.warning(
+                            "[EventBus] ambient context 丢弃: 宿主无 note_ambient_context (lanlan=%s)",
+                            lanlan,
+                        )
+                        return
+                    # Same body the callback would have carried, in preference
+                    # order: the metadata's own text wins, then the event's
+                    # summary/detail, then the push text.
+                    _ambient_text = (
+                        _ambient_payload.get("text")
+                        or event.get("summary")
+                        or event.get("detail")
+                        or text
+                        or ""
+                    )
+                    _ambient_ttl = _ambient_payload.get("ttl_s", 30)
+                    _ambient_ok = False
+                    try:
+                        _ambient_ok = bool(
+                            _note_ambient(
+                                provider=_ambient_payload.get("provider"),
+                                text=_ambient_text,
+                                data=_ambient_payload.get("data"),
+                                ttl_s=_ambient_ttl,
+                                priority=_ambient_payload.get("priority", 0),
+                            )
+                        )
+                    except Exception as e:
+                        # Never let a snapshot break event dispatch: the
+                        # manager sanitizes internally, this is belt-and-braces.
+                        logger.warning(
+                            "[EventBus] ambient context 记录失败 (lanlan=%s): %s",
+                            lanlan,
+                            e,
+                        )
+                    if _ambient_ok:
+                        logger.info(
+                            "[EventBus] ambient context 已记录 provider=%s ttl=%ss",
+                            _ambient_payload.get("provider"),
+                            _ambient_ttl,
+                        )
+                    else:
+                        logger.warning(
+                            "[EventBus] ambient context 丢弃: provider=%r 非法或记录失败 (lanlan=%s)",
+                            _ambient_payload.get("provider"),
+                            lanlan,
+                        )
+                    return
                 # origin is host-derived from event_type plus the validated
                 # user-plugin result contract:
                 #   "task_result"      → real task completion (agent_server._emit_task_result):
