@@ -1178,6 +1178,99 @@ async def _handle_agent_event(event: dict):
             # empty-check / log / callback paths use the stripped form.
             text = raw_text.strip()
 
+            event_metadata = (
+                event.get("metadata")
+                if isinstance(event.get("metadata"), dict)
+                else {}
+            )
+            # ── Ambient context (plugin → host background facts) ──────
+            # A plugin may declare ``metadata.context_type == "ambient"``
+            # to hand the host a snapshot of the outside world ("this song
+            # is playing", "the game is at act 2") that should inform the
+            # PROACTIVE prompt without ever becoming a conversation event.
+            # There was no channel for that: ``read`` drops a callback into
+            # the queue (stale snapshots then re-inject on the next user
+            # turn) and ``respond`` forces her to speak. This one does
+            # neither.
+            #
+            # Handled HERE — before the event body is consumed — on purpose:
+            # no media part is resolved or charged to the image budget, no
+            # chat/HUD render fires (a snapshot is a fact, never a bubble),
+            # and a malformed snapshot can never fall through into the
+            # callback path. Keep it above the ``if text or
+            # deferred_callback_images`` gate (a metadata-only push carries no
+            # body and would be dropped there) and above the chat/HUD render
+            # (a ``visibility=["chat"]`` push would paint a bubble). The
+            # snapshot text comes from ``metadata.ambient.text`` and falls
+            # back to the event's summary/detail/text, so an ambient push does
+            # not have to carry a body of its own.
+            #
+            # The contract rides on ai_behavior="blind" on purpose: an OLD
+            # host maps blind→delivery_mode="silent" and ignores the event
+            # entirely, so the same plugin is safe against both.
+            if event_metadata.get("context_type") == "ambient":
+                _ambient_payload = event_metadata.get("ambient")
+                if not isinstance(_ambient_payload, dict):
+                    logger.warning(
+                        "[EventBus] ambient context 丢弃: metadata.ambient 不是 dict (lanlan=%s)",
+                        lanlan,
+                    )
+                    return
+                _note_ambient = getattr(mgr, "note_ambient_context", None)
+                if not callable(_note_ambient):
+                    logger.warning(
+                        "[EventBus] ambient context 丢弃: 宿主无 note_ambient_context (lanlan=%s)",
+                        lanlan,
+                    )
+                    return
+                # Same body the callback would have carried, in preference
+                # order: the metadata's own text wins, then the event's
+                # summary/detail, then the push text.
+                _ambient_text = (
+                    _ambient_payload.get("text")
+                    or event.get("summary")
+                    or event.get("detail")
+                    or text
+                    or ""
+                )
+                # No default here: ``None`` means "let the manager apply its
+                # own default", so the TTL default lives in exactly one place
+                # (``note_ambient_context``) instead of two constants that can
+                # drift apart.
+                _ambient_ttl = _ambient_payload.get("ttl_s")
+                _ambient_ok = False
+                try:
+                    _ambient_ok = bool(
+                        _note_ambient(
+                            provider=_ambient_payload.get("provider"),
+                            text=_ambient_text,
+                            data=_ambient_payload.get("data"),
+                            ttl_s=_ambient_ttl,
+                            priority=_ambient_payload.get("priority", 0),
+                        )
+                    )
+                except Exception as e:
+                    # Never let a snapshot break event dispatch: the
+                    # manager sanitizes internally, this is belt-and-braces.
+                    logger.warning(
+                        "[EventBus] ambient context 记录失败 (lanlan=%s): %s",
+                        lanlan,
+                        e,
+                    )
+                if _ambient_ok:
+                    logger.info(
+                        "[EventBus] ambient context 已记录 provider=%s ttl=%s",
+                        _ambient_payload.get("provider"),
+                        "manager-default" if _ambient_ttl is None else f"{_ambient_ttl}s",
+                    )
+                else:
+                    logger.warning(
+                        "[EventBus] ambient context 丢弃: provider=%r 非法或记录失败 (lanlan=%s)",
+                        _ambient_payload.get("provider"),
+                        lanlan,
+                    )
+                return
+
             # v2 push_message: media parts (image/audio/video) ride on the
             # same proactive_message event. Image parts are either injected
             # into the active model session or retained on the callback that
@@ -1515,87 +1608,6 @@ async def _handle_agent_event(event: dict):
                 # Plugin emit sites already pass explicit source_kind/source_name.
                 _channel = event.get("channel") or "unknown"
                 source_kind, source_name = _resolve_event_source(event)
-                event_metadata = (
-                    event.get("metadata")
-                    if isinstance(event.get("metadata"), dict)
-                    else {}
-                )
-                # ── Ambient context (plugin → host background facts) ──────
-                # A plugin may declare ``metadata.context_type == "ambient"``
-                # to hand the host a snapshot of the outside world ("this song
-                # is playing", "the game is at act 2") that should inform the
-                # PROACTIVE prompt without ever becoming a conversation event.
-                # There was no channel for that: ``read`` drops a callback into
-                # the queue (stale snapshots then re-inject on the next user
-                # turn) and ``respond`` forces her to speak. This one does
-                # neither.
-                #
-                # The contract rides on ai_behavior="blind" on purpose: an OLD
-                # host maps blind→delivery_mode="silent" and ignores the event
-                # entirely, so the same plugin is safe against both. Here, on a
-                # new host, the snapshot is taken out of the event flow before
-                # any of it is built: no callback, no queue entry, no proactive
-                # submit, no frontend render. Malformed ambient metadata is
-                # dropped the same way — a broken snapshot must not fall through
-                # into the ordinary callback path and surface as a chat event.
-                if event_metadata.get("context_type") == "ambient":
-                    _ambient_payload = event_metadata.get("ambient")
-                    if not isinstance(_ambient_payload, dict):
-                        logger.warning(
-                            "[EventBus] ambient context 丢弃: metadata.ambient 不是 dict (lanlan=%s)",
-                            lanlan,
-                        )
-                        return
-                    _note_ambient = getattr(mgr, "note_ambient_context", None)
-                    if not callable(_note_ambient):
-                        logger.warning(
-                            "[EventBus] ambient context 丢弃: 宿主无 note_ambient_context (lanlan=%s)",
-                            lanlan,
-                        )
-                        return
-                    # Same body the callback would have carried, in preference
-                    # order: the metadata's own text wins, then the event's
-                    # summary/detail, then the push text.
-                    _ambient_text = (
-                        _ambient_payload.get("text")
-                        or event.get("summary")
-                        or event.get("detail")
-                        or text
-                        or ""
-                    )
-                    _ambient_ttl = _ambient_payload.get("ttl_s", 30)
-                    _ambient_ok = False
-                    try:
-                        _ambient_ok = bool(
-                            _note_ambient(
-                                provider=_ambient_payload.get("provider"),
-                                text=_ambient_text,
-                                data=_ambient_payload.get("data"),
-                                ttl_s=_ambient_ttl,
-                                priority=_ambient_payload.get("priority", 0),
-                            )
-                        )
-                    except Exception as e:
-                        # Never let a snapshot break event dispatch: the
-                        # manager sanitizes internally, this is belt-and-braces.
-                        logger.warning(
-                            "[EventBus] ambient context 记录失败 (lanlan=%s): %s",
-                            lanlan,
-                            e,
-                        )
-                    if _ambient_ok:
-                        logger.info(
-                            "[EventBus] ambient context 已记录 provider=%s ttl=%ss",
-                            _ambient_payload.get("provider"),
-                            _ambient_ttl,
-                        )
-                    else:
-                        logger.warning(
-                            "[EventBus] ambient context 丢弃: provider=%r 非法或记录失败 (lanlan=%s)",
-                            _ambient_payload.get("provider"),
-                            lanlan,
-                        )
-                    return
                 # origin is host-derived from event_type plus the validated
                 # user-plugin result contract:
                 #   "task_result"      → real task completion (agent_server._emit_task_result):

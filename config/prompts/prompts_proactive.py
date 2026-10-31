@@ -4475,8 +4475,8 @@ PROACTIVE_AMBIENT_CONTEXT_HEADER = {
     "zh-TW": "環境已知資訊（背景事實，不必刻意提及，也不要當成使用者剛說的話）：",
     "en": "Known ambient context (background facts; no need to bring them up, and do not treat them as something the user just said):",
     "ja": "環境の既知情報（背景の事実であり、無理に話題に出す必要はありません。また、ユーザーが今話したこととして扱わないでください）：",
-    "ko": "환경 기지 정보(배경 사실이며, 굳이 언급할 필요는 없고 사용자가 방금 한 말로 취급하지 마십시오):",
-    "ru": "Известный контекст окружения (фоновые факты; не нужно специально их упоминать и не относись к ним как к тому, что пользователь только что сказал):",
+    "ko": "환경 정보(배경 사실이며, 굳이 언급할 필요는 없고 사용자가 방금 한 말로 취급하지 마십시오):",
+    "ru": "Известный контекст окружения (фоновые факты; специально их не упоминай и не относись к ним как к тому, что пользователь только что сказал):",
     "es": "Contexto ambiental conocido (hechos de fondo; no hace falta mencionarlos y no los trates como algo que el usuario acaba de decir):",
     "pt": "Contexto ambiente conhecido (fatos de fundo; não é preciso mencioná-los e não os trate como algo que o usuário acabou de dizer):",
 }
@@ -4494,7 +4494,8 @@ def get_proactive_ambient_context_hint(
     trailing block for the Phase 2 proactive prompt.
 
     Kept deliberately free-form rather than a numbered section: it lands in the
-    existing ``music_playing_hint`` slot, which callers append to the end of the
+    generic trailing free-text slot (``Phase2PromptContext.extra_context_hints``,
+    rendered right after ``music_playing_hint``), so it reaches the end of the
     prompt without registering a new prompt parameter.
 
     ``master_name`` is accepted for signature parity with the sibling hint
@@ -4504,8 +4505,8 @@ def get_proactive_ambient_context_hint(
     Every entry text goes through ``_escape_format_braces()``: the return value
     is spliced into a prompt that is later run through ``.format()``, so a
     bracketed title (a song literally named ``{title}``) would otherwise raise
-    KeyError there. Same contract as ``get_proactive_music_playing_hint``
-    (Codex review #1043).
+    KeyError there. Mirrors the escaped-brace contract of
+    ``get_proactive_music_playing_hint``.
     """  # noqa: DOCSTRING_CJK
     lang_key = _normalize_prompt_language(lang)
     header = PROACTIVE_AMBIENT_CONTEXT_HEADER.get(

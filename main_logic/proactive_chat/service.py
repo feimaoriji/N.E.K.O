@@ -115,9 +115,8 @@ from main_logic.proactive_chat.mini_game_invite import (
     _pick_mini_game_type,
 )
 from main_logic.proactive_chat.music_recommendation import (
-    _build_ambient_context_hint,
     _build_music_dynamic_context,
-    _build_music_playing_hint,
+    _build_phase2_tail_hints,
     _select_music_recommendation,
 )
 from main_logic.proactive_chat.music_refusal import is_music_refusal_cooldown_active
@@ -2367,32 +2366,24 @@ async def handle_proactive_chat(
         _expects_source_tag = (
             bool(external_section) or bool(music_section) or bool(meme_section)
         )
-        music_playing_hint = _build_music_playing_hint(
+        music_playing_hint, extra_context_hints = _build_phase2_tail_hints(
+            mgr=mgr,
             is_playing_music=is_playing_music,
             current_track=current_track,
             master_name=master_name_current,
             lang=proactive_lang,
         )
         # Ambient snapshots pushed by plugins (context_type="ambient") ride the
-        # same trailing free-text slot as the playback hint: it is appended to
-        # the end of the Phase 2 prompt, so this adds no prompt parameter and no
-        # frontend switch. Empty when no plugin published anything (or all
-        # snapshots expired), which keeps the prompt byte-identical to before.
-        ambient_hint = _build_ambient_context_hint(
-            mgr=mgr,
-            master_name=master_name_current,
-            lang=proactive_lang,
-        )
-        if ambient_hint:
+        # Phase 2 prompt's generic trailing slots — no new prompt parameter and
+        # no frontend switch. ``music_playing_hint`` stays playback-only: the
+        # split comes from ``_build_phase2_tail_hints`` instead of string
+        # concatenation here, where the two would merge into one string and
+        # render identically.
+        if extra_context_hints:
             logger.info(
                 "[%s] ambient context 注入自主搭话 prompt：%s",
                 lanlan_name,
-                ambient_hint[:200],
-            )
-            music_playing_hint = (
-                f"{music_playing_hint}\n\n{ambient_hint}"
-                if music_playing_hint
-                else ambient_hint
+                extra_context_hints[0][:200],
             )
 
         # Render activity snapshot as prompt; absent snapshot yields empty string, making decision-frame
@@ -2473,6 +2464,7 @@ async def handle_proactive_chat(
             meme_section=meme_section,
             source_instruction=source_instruction,
             output_format_section=output_format_section,
+            extra_context_hints=extra_context_hints,
         )
         dynamic_context_for_phase2 = _build_music_dynamic_context(
             selected_music_link=selected_music_link,

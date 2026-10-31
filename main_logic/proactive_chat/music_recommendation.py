@@ -248,15 +248,49 @@ def _build_ambient_context_hint(*, mgr, master_name: str, lang: str) -> str:
     try:
         entries = getter()
     except Exception as exc:
-        logger.debug("[ambient] snapshot read failed: %s", exc)
+        logger.debug(
+            "[%s] ambient 快照读取失败: %s", getattr(mgr, "lanlan_name", "?"), exc
+        )
         return ""
     if not entries:
         return ""
     try:
         return get_proactive_ambient_context_hint(entries, master_name, lang)
     except Exception as exc:
-        logger.debug("[ambient] hint render failed: %s", exc)
+        logger.debug(
+            "[%s] ambient 提示渲染失败: %s", getattr(mgr, "lanlan_name", "?"), exc
+        )
         return ""
+
+
+def _build_phase2_tail_hints(
+    *,
+    mgr,
+    is_playing_music: bool,
+    current_track: dict | None,
+    master_name: str,
+    lang: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Return the Phase 2 prompt's trailing slots as ``(music, extra)``.
+
+    The split is the contract, not a convenience: ``music_playing_hint`` must
+    keep meaning "the playback hint" and nothing else, so a generic context
+    source (an ambient snapshot today) appends its own entry to ``extra``
+    instead of being concatenated onto the music string. Merging by hand at
+    the call site renders the same prompt, so the two would drift back into one
+    string unnoticed; keeping the split in a single function gives it one place
+    to hold.
+    """
+    music_playing_hint = _build_music_playing_hint(
+        is_playing_music=is_playing_music,
+        current_track=current_track,
+        master_name=master_name,
+        lang=lang,
+    )
+    ambient_hint = _build_ambient_context_hint(
+        mgr=mgr, master_name=master_name, lang=lang
+    )
+    return music_playing_hint, ((ambient_hint,) if ambient_hint else ())
 
 
 def _build_music_dynamic_context(

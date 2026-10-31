@@ -3734,7 +3734,7 @@ class ProactiveMixin:
         *,
         text: str = "",
         data=None,
-        ttl_s: float = _AMBIENT_TTL_DEFAULT_S,
+        ttl_s: Optional[float] = None,
         priority=0,
     ) -> bool:
         """Record one ambient snapshot; the SAME provider replaces the previous one.
@@ -3743,6 +3743,10 @@ class ProactiveMixin:
         pushes from one provider are the same fact twice, not two facts. Queueing
         them would re-inject a stale song/level on the next user turn, which is
         exactly what this channel exists to avoid.
+
+        ``ttl_s=None`` means "use the manager default" — callers that have no
+        opinion (the plugin event bridge) pass nothing rather than importing a
+        second copy of the number.
 
         Returns whether the snapshot was accepted. Invalid input is rejected
         (never raised) because the caller is the plugin event handler and must
@@ -3762,12 +3766,15 @@ class ProactiveMixin:
                 else ""
             )
             payload = dict(data) if isinstance(data, dict) else {}
-            try:
-                ttl = float(ttl_s)
-            except (TypeError, ValueError):
+            if ttl_s is None:
                 ttl = _AMBIENT_TTL_DEFAULT_S
-            if ttl != ttl:  # NaN — every comparison below would be False.
-                ttl = _AMBIENT_TTL_DEFAULT_S
+            else:
+                try:
+                    ttl = float(ttl_s)
+                except (TypeError, ValueError):
+                    ttl = _AMBIENT_TTL_DEFAULT_S
+                if ttl != ttl:  # NaN — every comparison below would be False.
+                    ttl = _AMBIENT_TTL_DEFAULT_S
             ttl = max(_AMBIENT_TTL_MIN_S, min(_AMBIENT_TTL_MAX_S, ttl))
             try:
                 prio = int(priority or 0)

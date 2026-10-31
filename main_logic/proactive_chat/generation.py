@@ -350,11 +350,26 @@ class Phase2PromptContext:
     meme_section: str
     source_instruction: str
     output_format_section: str
+    # Generic trailing free-text slots, rendered right after
+    # ``music_playing_hint`` in the same placeholder. A tuple on purpose: a new
+    # context source (an ambient snapshot today, something else tomorrow)
+    # appends its own paragraph instead of concatenating onto
+    # ``music_playing_hint``, which keeps the music hint's contract ("one hint,
+    # music only") intact and spares every caller re-implementing the same
+    # "\n\n" merge. Empty by default, so the rendered prompt stays
+    # byte-identical when nothing is supplied.
+    extra_context_hints: tuple[str, ...] = ()
 
     def render(self, *, proactive_lang: str, master_name: str) -> str:
+        # Join here rather than in every caller: ``get_proactive_generate_prompt``
+        # keeps its single-string signature, and an all-empty tail yields "",
+        # exactly what the pre-existing slot expected.
+        tail = "\n\n".join(
+            part for part in (self.music_playing_hint, *self.extra_context_hints) if part
+        )
         return get_proactive_generate_prompt(
             proactive_lang,
-            self.music_playing_hint,
+            tail,
             has_music=bool(self.music_section),
             has_meme=bool(self.meme_section),
             master_name=master_name,
