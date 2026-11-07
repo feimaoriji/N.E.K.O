@@ -134,13 +134,23 @@ PERSONA_RENDER_ENCODING = "o200k_base"   # tiktoken encoding
 # they expire. The original fact still goes through the ordinary pipeline;
 # expiry only takes it out of the resident section.
 PINNED_FACT_TTL_TIERS_DAYS = (3, 14, 90, 365)
-"""The only lifetimes a pinned fact can have, in days.
+"""The only lifetimes a pinned fact can have, in days, counted from when it was
+said. The tier is a hard ceiling: an entry leaves the section when it runs out,
+and neither a model decision nor a date can keep it longer (a renewal starts a
+new lifetime from the later mention).
 - 3: things happening right now (a cold, working late tonight).
 - 14: near-term plans (an exam next week, a business trip).
 - 90: a phase of life (a new job, studying for an exam, recovering from an injury).
 - 365: long-lived but changeable (an allergy, a birthday, how the user wants to be called).
 - A dated event takes the smallest tier that still covers the end of the event;
-  memory/pinned_facts.py:snap_ttl_days rounds any other value up the same way."""
+  memory/pinned_facts.py:snap_ttl_days rounds any other value up the same way.
+  An entry with a known end (``event_when.end``) leaves PINNED_FACT_DUE_GRACE_DAYS
+  after it, so an exam is not carried for the rest of its tier."""
+
+PINNED_FACT_DUE_GRACE_DAYS = 1
+"""How long a dated entry stays after its event ends: ``expire_at`` is
+``min(tier ceiling, event end + this)``. One day covers an end given at day
+granularity whose time of day is unknown."""
 
 PINNED_FACT_DEFAULT_TTL_DAYS = 14
 """Tier used when the model sets ``pin`` but gives no usable ``pin_ttl_days``.
@@ -176,7 +186,56 @@ newer change."""
 
 PINNED_FACT_RESOLVE_MODEL_TIER = "correction"
 """Model tier of the add / replace / renew / remove decision, the same tier and
-thinking mode as persona correction resolution."""
+thinking mode as persona correction resolution. The same call may also retire
+entries that are over (fulfilled, no longer valid, or past their date)."""
+
+PINNED_FACT_REVIEW_INTERVAL_HOURS = 24
+"""The idle-time check that retires finished entries runs at most this often per
+character, and only when the section is not empty and no model has looked at
+the whole section (an admission resolve or an earlier check) within it."""
+
+PINNED_FACT_REVIEW_MODEL_TIER = "summary"
+"""Model tier of the idle-time check, called without thinking: it only answers
+retire or keep per entry, quoting the conversation as evidence."""
+
+PINNED_FACT_REVIEW_LOOKBACK_DAYS = 7
+"""How far back the idle-time check reads the conversation: from the oldest
+live entry's noted time, but never further back than this."""
+
+PINNED_FACT_REVIEW_CONVERSATION_MAX_TOKENS = 2000
+"""Token budget of the conversation in the idle-time check; over it, the
+oldest messages are left out."""
+
+PINNED_FACT_REVIEW_MESSAGE_MAX_TOKENS = 150
+"""Per-message cap in the idle-time check, so one long message cannot take the
+whole conversation budget."""
+
+PINNED_FACT_RETIRE_REASON_MAX_TOKENS = 40
+"""Cap on the reason a model gives for retiring an entry, kept in the history
+for diagnosis and never rendered."""
+
+PINNED_COMMITMENT_DUE_SOON_DAYS = 2
+"""An open commitment due within this many days (or already due, while it is
+still in the section) is offered to proactive chat as its first cue."""
+
+PINNED_COMMITMENT_SURFACE_COOLDOWN_HOURS = 12
+"""After proactive chat was offered a commitment, the same one is not offered
+again for this long, so she does not bring up one promise in every round."""
+
+PINNED_MENTION_COOLDOWN_HOURS = 24
+"""Once a reply of the character's brings up a pinned entry, it renders under
+"recently mentioned" (remembered, not to be raised on her own initiative) for
+this long, and a commitment in that cooldown is not offered to proactive chat.
+A mention while the cooldown still runs extends it; one after it ran out
+doubles the next cooldown, so a matter raised every so often is raised ever
+more rarely."""
+
+PINNED_MENTION_COOLDOWN_MAX_HOURS = 168
+"""Cap on the doubling mention cooldown (a week)."""
+
+PINNED_COMMITMENT_DUE_LEAD_HOURS = 12
+"""A dated commitment's mention cooldown ends at the latest this long before
+it is due, so having mentioned a promise never keeps it from being kept."""
 
 # ── Overall cap for scoped (group) L10 core memory ──────────────────────────
 # Per-subject budgets stop competition but not total growth: rendering five
@@ -668,6 +727,15 @@ REFLECTION_EXISTING_IMPRESSIONS_MAX_TOKENS = 800
 - Each line is also capped at ``REFLECTION_TEXT_MAX_TOKENS`` first, so
   5 × 150 tokens plus ids fit."""
 
+REFLECTION_RETIRED_RESTATEMENT_MIN_COSINE = 0.92
+"""Cosine at which a newly synthesized reflection counts as restating an
+entry weekly introspection permanently suppressed (same subject); such a
+reflection is stored already suppressed instead of reaching the prompt for a
+week. Near-paraphrase level on purpose: a merely related, more concrete line
+must pass. Without vectors only an identical text matches.
+- Why not reuse the existing-impressions check: retired entries are kept out of
+  that pool, or a fresh fact batch could be swallowed into a hollow line."""
+
 REFLECTION_COVERED_FACT_IDS_MAX = 100
 """Newest fact ids kept in an entry's ``covered_fact_ids`` audit list.
 - Written when synthesis skips a batch as already covered by that reflection
@@ -975,6 +1043,49 @@ MEMORY_REFINE_CRON_INTERVAL_SECONDS = 1800
 - Every 30 minutes; engine cluster_hash checks skip recently reviewed clusters
   at zero cost, so frequent polls do not waste LLM tokens.
 - Both cron loops share the interval, staggering starts through _INITIAL_DELAY_*."""
+
+# ---- Memory: weekly introspection ----
+# Reads the persona + reflection block exactly as /new_dialog injects it and
+# lets the correction-tier model (thinking on) suppress / rewrite / merge the
+# entries that are contradictory, redundant, hollow or stale. Gated on
+# powerful_memory like refine; runs only while the system is idle.
+
+MEMORY_INTROSPECTION_INTERVAL_SECONDS = 7 * 24 * 3600
+"""Seconds between two completed introspection runs of one character.
+A character with no recorded run is reviewed at its first idle moment, so
+existing users are covered right after the upgrade."""
+
+MEMORY_INTROSPECTION_RETRY_BACKOFF_SECONDS = (30 * 60, 2 * 3600, 6 * 3600)
+"""Waits before retrying a run that failed transiently (dropped connection,
+5xx, rate limit, a write that failed). One more transient failure after the
+last step ends the attempt until the next weekly cycle. A run that timed out,
+ran out of output or returned unparseable output is not retried at all: the
+same input would most likely fail the same way, and next week's input differs.
+A run cut short by the process exiting records nothing and reruns at the first
+idle moment after restart."""
+
+MEMORY_INTROSPECTION_OUTPUT_CAPS = (32768, 16384, 8192, 4096)
+"""Output allowance (thinking + JSON answer) for the introspection call, walked
+down while the endpoint rejects a cap as above the model's limit. Headroom, not
+a target: the call still ends at MEMORY_LLM_HARD_TIMEOUT_SECONDS (110 s, bound
+by the upstream proxy), so the real reply is far shorter. Larger than the shared
+MEMORY_THINKING_OUTPUT_MAX_TOKENS because this prompt carries the whole
+injected memory block and up to 15 actions to write."""
+
+MEMORY_INTROSPECTION_MAX_ROUNDS = 3
+"""Review → apply → re-render rounds per run. Each round re-renders because
+entries leaving the budget let others move up into it; a round with no
+applied action ends the run early."""
+
+MEMORY_INTROSPECTION_MAX_ACTIONS_PER_ROUND = 15
+"""Accepted suppress / rewrite / merge actions per round; the rest are
+rejected and counted as over_cap."""
+
+MEMORY_INTROSPECTION_INPUT_MAX_TOKENS = 16000
+"""Backstop cap on the annotated memory block in the prompt. The render is
+already bounded (persona and reflection pools of 2000 tokens each plus count
+caps on character-card and do-not-mention lines); this only bites when a
+very large character card outgrows that sum."""
 
 # ---- Memory: scoped subject eviction (group memory series 5/7, track one) ----
 # Scoped group/member entries receive no evidence signals (facts persist with
