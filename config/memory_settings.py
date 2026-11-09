@@ -38,12 +38,36 @@ EVIDENCE_ARCHIVE_THRESHOLD = -2.0    # score ≤ -2 → archive_candidate
 WEAK_MEMORY_AUTO_CONFIRM_DAYS = 7   # pending → confirmed, measured from created_at.
 WEAK_MEMORY_AUTO_PROMOTE_DAYS = 7   # confirmed → promoted, measured from confirmed_at.
 
+# Scoped (group / member / cross-group person) reflections into scoped persona.
+# They get no feedback, so only being seen again lets one in: on at least this
+# many distinct days, by the record dates of the facts behind it that are not
+# the character's own words, and at least this many days after the first of
+# them. Strong memory only: with it off nothing cleans up after a promotion
+# (correction queue, scoped refine, introspection), so none happens.
+SCOPED_PROMOTION_MIN_OBSERVED_DAYS = 4
+SCOPED_PROMOTION_MIN_AGE_DAYS = 30
+# Reinforcement a scoped reflection gains each time others' words are seen to
+# restate it again (synthesis judges a batch covered by it, or scoped refine
+# merges it with another such line); the decay clock restarts too. Equal to the
+# highest synthesis head start (importance 10, memory.evidence), so a line just
+# seen again ranks above every fresh one and keeps its place in the per-subject
+# render budget. Capped by EVIDENCE_REINFORCEMENT_CAP like every reinforcement.
+SCOPED_REOBSERVED_REINFORCEMENT = 0.8
+# How many observation days a scoped reflection keeps (the first one and the
+# latest ones); the promotion gate needs the count and the first day only.
+SCOPED_OBSERVED_DAYS_MAX = 64
+
 # §3.5.3 Archival (sub_zero_days counts + shard-size cap).
 EVIDENCE_ARCHIVE_DAYS = 14           # Archive after this many accumulated sub_zero days.
 ARCHIVE_FILE_MAX_ENTRIES = 500       # Maximum entries per archive shard.
 
 # §3.1.5 Ignored penalty.
 IGNORED_REINFORCEMENT_DELTA = -0.2   # check_feedback ignored → reinforcement += delta
+# check_feedback engaged: the user went on with the observation's topic, or let
+# it stand, without saying yes. Some weight, but not an explicit user signal
+# (memory.evidence.awaits_user_signal does not count it): chatting on cannot
+# confirm a reflection that rests only on the AI's own words.
+USER_ENGAGED_DELTA = 0.3
 
 # §3.1.8 Delta weights by signal source (v1.2.1 direct vs indirect).
 # Direct signals (explicit surfaced-reflection responses / negative-keyword hits) weight1.0;
@@ -61,6 +85,13 @@ USER_KEYWORD_REBUT_DELTA = 1.0       # Keywords + LLM target validation (direct 
 # Default first2 signals0.5 each; from third,0.5 +0.5 bonus=1.0.
 USER_FACT_REINFORCE_COMBO_THRESHOLD = 2   # Active when count > threshold.
 USER_FACT_REINFORCE_COMBO_BONUS = 0.5     # Extra weight per signal above threshold.
+
+# Upper bound on reinforcement, applied both when it is read and when it is
+# written, so stored values above it count as the cap at once. Uncapped, combo
+# reinforcement reached 160, and a user rebuttal (USER_REBUT_DELTA) could no
+# longer move the entry. Above EVIDENCE_PROMOTED_THRESHOLD so promotion keeps
+# its room; protected entries still score inf.
+EVIDENCE_REINFORCEMENT_CAP = 3.0
 
 # §3.4.3 Background signal-extraction triggers.
 EVIDENCE_SIGNAL_CHECK_ENABLED = True             # Independent switch.
@@ -668,6 +699,16 @@ REFLECTION_SYNTHESIS_FACTS_MAX = 20
 - Upstream: prolonged unabsorbed facts accumulate; the outer aget_unabsorbed_facts
   loop currently has no count limit, making this the only protection.
 - Rationale: 30 entries × average 50 tokens = 1500 tokens, sufficient for synthesis."""
+
+REFLECTION_SYNTHESIS_MAX_PER_BATCH = 3
+"""Most reflections one synthesis call may write.
+- Purpose: a batch of up to REFLECTION_SYNTHESIS_FACTS_MAX facts often spans
+  unrelated topics; with one reflection per call the other topics were
+  absorbed along with it and never synthesized. REFLECTION_PROMPT asks for at
+  most this many, one per topic, and extra objects in the answer are dropped.
+- Rationale: 3 covers the topics a 20-fact batch usually spans while keeping
+  the output (each line ≤ REFLECTION_TEXT_MAX_TOKENS) and the pending pool's
+  growth bounded."""
 
 MEMORY_REFLECTION_SYNTHESIS_INTERVAL_SECONDS = 180
 """Polling interval in seconds for ``_periodic_reflection_synthesis_loop``.
