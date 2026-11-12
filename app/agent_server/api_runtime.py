@@ -16,6 +16,7 @@
 """Analyzer, lifecycle, and task endpoints for the agent server."""
 
 import math
+import uuid
 
 from .api_shared import (  # noqa: F401
     AGENT_HISTORY_TURNS,
@@ -432,11 +433,26 @@ def _forward_conversation_turn(event: Dict[str, Any]) -> bool:
             "content": content,
             "metadata": metadata,
         }
+        for key in ("input_id", "reply_id"):
+            value = (event or {}).get(key, metadata.get(key))
+            if isinstance(value, str) and value:
+                record[key] = value
+        origin = (event or {}).get("origin", metadata.get("origin"))
+        if isinstance(origin, dict):
+            record["origin"] = dict(origin)
+        producer_time = (event or {}).get("ts")
+        if not isinstance(producer_time, bool):
+            try:
+                occurred_at = float(producer_time)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if math.isfinite(occurred_at):
+                    record["occurred_at"] = occurred_at
         # The publisher's event_id is this message's identity end to end, so a
         # puller can dedupe without unpacking, same as a frame.
         event_id = str((event or {}).get("event_id") or "")
-        if event_id:
-            record["id"] = event_id
+        record["id"] = event_id or uuid.uuid4().hex
         publish_record(
             store=CONVERSATIONS_STORE_NAME,
             record=record,
@@ -445,6 +461,27 @@ def _forward_conversation_turn(event: Dict[str, Any]) -> bool:
         return True
     except Exception as exc:
         logger.debug("[ConversationBus] forward failed: %s", exc)
+        return False
+
+
+def _forward_conversation_fact(event: Dict[str, Any]) -> bool:
+    """Forward an observed fact; never run plugin callbacks in this receive path."""
+    if not _user_plugins_enabled():
+        return False
+    try:
+        from plugin.server.lifecycle import get_conversation_service
+        from plugin.server.messaging.bus_subscriptions import bus_subscription_manager
+
+        payload = event.get("payload")
+        if get_conversation_service(require_ready=False) is None or not isinstance(payload, dict):
+            return False
+        payload = dict(payload)
+        payload["character"] = event.get("lanlan_name")
+        payload["observed_at"] = time.time()
+        bus_subscription_manager.accept_raw_conversation_fact(event.get("fact"), payload)
+        return True
+    except Exception:
+        logger.debug("[ConversationBus] fact forwarding failed", exc_info=True)
         return False
 
 
@@ -560,6 +597,9 @@ async def _on_session_event(event: Dict[str, Any]) -> None:
     if event_type == "conversation_turn_observed":
         _forward_user_context(event)
         _forward_conversation_turn(event)
+        return
+    if event_type == "conversation_fact_observed":
+        _forward_conversation_fact(event)
         return
     if event_type == "analyze_request":
         messages = event.get("messages", [])
@@ -949,6 +989,13 @@ async def startup():
     except Exception as e:
         logger.warning(f"[Agent] Failed to set http plugin_list_provider: {e}")
 
+    # NekoClaw host (task brain, task agents, capability gateway). This only tells
+    # it how to read this process's switches; it is built on the first dispatch
+    # and nothing dispatches to it yet. Must stay free of I/O: see the startup
+    # path rules.
+    from .nekoclaw_mount import mount_nekoclaw_host
+    mount_nekoclaw_host(_plugin_list_change_token)
+
     # Start computer-use scheduler
     sch_task = asyncio.create_task(_computer_use_scheduler_loop())
     Modules._persistent_tasks.add(sch_task)
@@ -1054,6 +1101,10 @@ async def shutdown():
             )
     except asyncio.TimeoutError:
         logger.warning("[Agent] ⚠️ 整体清理过程超时，强制完成关闭")
+
+    # Stops the NekoClaw host if anything ever started it; a no-op otherwise.
+    from .nekoclaw_mount import shutdown_nekoclaw_host
+    await shutdown_nekoclaw_host()
 
     bridge = Modules.agent_bridge
     if bridge is not None:

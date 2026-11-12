@@ -282,6 +282,8 @@
     // CSS 的居中（top/left:50% + translate）。绝不退回 restorePosition() 的
     // positionWindowAtLeftMiddle() —— 那会把完整窗口甩到屏幕左中。
     I.restoreFullPosition = function restoreFullPosition() {
+        // Electron 完整窗自引入起就由桌面端按 fullChat 保存和恢复原生尺寸与位置。
+        if (document.body?.matches('.neko-electron-runtime[data-chat-host-kind="full"]')) return;
         if (I.isMobileWidth()) return;
         var shell = I.getShell();
         if (!shell) return;
@@ -1908,7 +1910,7 @@
         return hadVisibleState;
     }
 
-    function replaceMessages(messages, historyRestore) {
+    function replaceMessages(messages, historyRestore, keepClearedScreen) {
         cancelMessageReactions();
         // Compute fallback start past any explicit sortKey in incoming batch
         var maxIncomingSortKey = Array.isArray(messages)
@@ -1939,6 +1941,7 @@
         window.dispatchEvent(new CustomEvent('react-chat-window:messages-replaced', {
             detail: {
                 conversationReset: I.state.messages.length === 0,
+                keepClearedScreen: keepClearedScreen === true,
                 historyRestore: historyRestore === true,
                 streamingTurnIds: historyRestore ? I.state.messages.filter(function (message) {
                     return message.role === 'assistant' && message.status === 'streaming' && message.turnId;
@@ -1949,8 +1952,8 @@
         return I.state.messages;
     }
 
-    I.setMessages = function setMessages(messages) {
-        return replaceMessages(messages);
+    I.setMessages = function setMessages(messages, options) {
+        return replaceMessages(messages, false, !!(options && options.keepClearedScreen));
     };
 
     function mergeChatHistoryReplyBlocks(savedBlocks, liveBlocks, pendingMusicCommand) {
@@ -2291,6 +2294,7 @@
     };
 
     var MAX_MESSAGES = 50;
+    window.reactChatWindowHost.maxMessages = MAX_MESSAGES;
 
     function getNextAppendSortKey() {
         var maxExistingSortKey = Array.isArray(I.state.messages)

@@ -651,13 +651,14 @@ async def _periodic_idle_maintenance_loop():
                     # fact_dedup_resolver is None when vectors are disabled
                     # or bootstrap failed — legacy hash + FTS5 dedup
                     # remains the entire dedup pipeline in that case.
-                    # Strong memory disabled: skip entirely (vector deduplication was added late in evidence-RFC).
-                    if powerful_enabled and runtime.fact_dedup_resolver is not None:
+                    # Recover already-committed handoffs even when strong memory is now disabled; only LLM review is gated.
+                    if runtime.fact_dedup_resolver is not None:
                         if not gates._is_idle():
                             break
                         try:
+                            await runtime.fact_store.aretry_pending_near_dups(name)
                             pending_dedup = await runtime.fact_dedup_resolver.aload_pending(name)
-                            if pending_dedup:
+                            if powerful_enabled and pending_dedup:
                                 logger.info(
                                     f"[IdleMaint] {name}: 发现 {len(pending_dedup)} 对未处理的 fact 候选去重，触发 LLM 审视"
                                 )
@@ -668,6 +669,17 @@ async def _periodic_idle_maintenance_loop():
                                     )
                         except Exception as e:
                             logger.warning(f"[IdleMaint] {name}: fact 向量去重失败: {e}")
+
+                    # -- Task 1c: One-time cleanup of duplicates older versions left. --
+                    # The organizer runs it once; the snapshot tells every other device.
+                    if not gates._is_idle():
+                        break
+                    try:
+                        from . import legacy_dedup
+                        await _run_with_character_language(
+                            name, lambda character: legacy_dedup.run(character, still_idle=gates._is_idle))
+                    except Exception as e:
+                        logger.warning(f"[IdleMaint] {name}: 旧重复事实清理失败: {type(e).__name__}")
 
                     # -- Task 2: Review persona contradictions (skip when strong memory is disabled). --
                     # resolve_corrections came from evidence-RFC. Contradictions may still be queued
