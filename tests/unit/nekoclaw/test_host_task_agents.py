@@ -24,6 +24,13 @@ from typing import Any
 
 import pytest
 
+from config.prompts.prompts_nekoclaw import REPLY_LANGUAGE_SENTENCE
+from config.prompts.prompts_nekoclaw_brain import (
+    TASK_AGENT_FAILED_ERROR,
+    TASK_AGENT_FAILED_NOTICE,
+    TASK_AGENT_FAILED_TEXTS,
+    TASK_AGENT_FAILED_WHY,
+)
 from tests.unit.nekoclaw.fakes import ScriptedLLM, call, finish, say
 from tests.unit.nekoclaw.host_fakes import (
     FakeDecisionLLM,
@@ -31,6 +38,7 @@ from tests.unit.nekoclaw.host_fakes import (
     make_host,
     outbox,
     scripted_runtime,
+    scripts_by_commission,
     wait_status,
     wait_until,
 )
@@ -107,11 +115,29 @@ async def test_commission_goes_to_a_task_agent_and_its_report_ends_it(hosts, tmp
     assert (done.route, done.runtime) == ("task_agent", "builtin")
     assert done.result_summary == "sorted 12 photos\nin D:/Photos/by-month"
     assert Path(done.workdir).is_dir()
-    # The task agent was given her sentence as its work and the user's words in its brief.
+    # The task agent was told what the commission is in the message that opens it: her
+    # sentence and the user's words. Its system prompt says whom it works for, and nothing
+    # of this commission: the session keeps it for the commissions that follow.
     request = llm.requests[0]
-    assert request[-1]["content"].startswith("sort the photos in my downloads folder")
-    assert "can you sort my photos" in request[0]["content"]
-    assert "commission for Lan" in request[0]["content"]
+    assert request[-1]["content"].startswith(
+        f"Commission {receipt.commission_id}\n"
+        "sort the photos in my downloads folder\n"
+        "What the user said: can you sort my photos"
+    )
+    assert "You work for Lan" in request[0]["content"]
+    assert "sort the photos" not in request[0]["content"] and "can you sort my photos" not in request[0]["content"]
+    # The session is the commission's own, under its id, and is closed again.
+    session = await host.ledger.get_session(done.session_id)
+    assert done.session_id == receipt.commission_id
+    assert (session.kind, session.runtime, session.workdir, session.session_dir) == (
+        "single",
+        "builtin",
+        done.workdir,
+        done.session_dir,
+    )
+    assert [event.payload for event in await _events(host, receipt.commission_id, "opened")] == [
+        {"session_id": receipt.commission_id}
+    ]
     # The session is closed again and its place is free.
     await wait_until(lambda: host.task_agents.running == [], what="the session being released")
     (report,) = await outbox(host, "task_result")
@@ -211,16 +237,37 @@ async def test_task_agent_that_cannot_be_started_fails_the_commission(hosts, tmp
     def broken(on_event: Any, callbacks: Any) -> Any:
         raise RuntimeError("the runtime process could not be created")
 
-    host = make_host(tmp_path, None, task_agent_model=fake_model, decision_llm=FakeDecisionLLM(), runtime_factory=broken)
+    counted: list[str] = []
+
+    async def meter(commission_id: str) -> bool:
+        counted.append(commission_id)
+        return True
+
+    host = make_host(
+        tmp_path,
+        None,
+        task_agent_model=fake_model,
+        decision_llm=FakeDecisionLLM(),
+        runtime_factory=broken,
+        task_agent_meter=meter,
+    )
     hosts.append(host)
 
-    receipt = await _dispatch(host, "sort the photos")
+    receipt = await _dispatch(host, "sort the photos", lang="zh-TW")
 
     failed = await wait_status(host, receipt.commission_id, "failed")
     assert "could not be started" in failed.status_reason
     assert host.task_agents.running == []
+    # No request was made, so none of the free quota went on it.
+    assert counted == []
     (report,) = await outbox(host, "task_result")
     assert report.payload["status"] == "failed"
+    # She is told in English, as a model is told what happened, and the HUD shows it in her
+    # dialogue's language; the error itself as it came. She is told at once.
+    told, shown = _failed("start", "zh-TW", "the runtime process could not be created")
+    assert (report.payload["summary"], report.payload["text"]) == (told, shown)
+    assert report.payload["delivery_mode"] == "proactive" and "visibility" not in report.payload
+    assert failed.result_summary == told
 
 
 async def test_without_a_model_no_task_agent_is_available(hosts, tmp_path):
@@ -261,11 +308,7 @@ async def test_commissions_beyond_the_limit_wait_in_the_queue(hosts, tmp_path):
         "empty the recycle bin": ScriptedLLM([[say("bin emptied"), finish()]]),
     }
     seen: list[str] = []
-
-    def pick(spec: Any) -> ScriptedLLM:
-        text = next(text for text in scripts if text in (spec.instructions or ""))
-        seen.append(text)
-        return scripts[text]
+    pick = scripts_by_commission(scripts, seen)
 
     host = _host(hosts, tmp_path, pick, max_task_agents=1)
 
@@ -279,7 +322,7 @@ async def test_commissions_beyond_the_limit_wait_in_the_queue(hosts, tmp_path):
     assert host.task_agents.running == [first.commission_id]
     assert host.task_agents.queued == [second.commission_id, third.commission_id]
     assert (await host.ledger.get(second.commission_id)).status == "queued"
-    assert seen == ["sort the photos"]
+    await wait_until(lambda: seen == ["sort the photos"], what="the first commission being asked about")
 
     release.set()
     await wait_status(host, first.commission_id, "done")
@@ -319,6 +362,17 @@ async def _filed(host: Any, text: str, **values: Any) -> Any:
         lanlan_name="Lan", title=text, dispatch_text=text, source="dispatch", **values
     )
     return commission
+
+
+def _failed(said: str, lang: str, detail: str = "") -> tuple[str, str]:
+    """What she is told of a commission that failed for a reason of the host's own, and what the HUD shows."""
+    told = TASK_AGENT_FAILED_NOTICE.format(why=TASK_AGENT_FAILED_WHY[said])
+    words = TASK_AGENT_FAILED_TEXTS[lang]
+    shown = words[said]
+    if detail:
+        told += TASK_AGENT_FAILED_ERROR.format(detail=detail)
+        shown += words["error"].format(detail=detail)
+    return told, shown
 
 
 def _slow_model() -> tuple[asyncio.Event, asyncio.Event, Any]:
@@ -388,6 +442,7 @@ async def test_a_place_freed_by_a_cancelled_start_goes_to_the_queue(hosts, tmp_p
     second = await _filed(host, "back up the notes")
     # A start that is itself cancelled while the session is prepared (callers
     # run starts as shielded tasks, so this is a shutdown cancelling them).
+    await host.task_agents._give_session(first)
     assert host.task_agents._take_place(first.id)
     starting = asyncio.ensure_future(host.task_agents._start(first.id, prompt="the drive is E: now"))
     await asyncio.wait_for(entered.wait(), 5)
@@ -510,7 +565,20 @@ async def test_stopping_while_the_session_comes_up_gives_it_no_work(hosts, tmp_p
         def __getattr__(self, name: str) -> Any:
             return getattr(self.inner, name)
 
-    host = make_host(tmp_path, None, task_agent_model=fake_model, decision_llm=FakeDecisionLLM(), runtime_factory=SlowStart)
+    counted: list[str] = []
+
+    async def meter(commission_id: str) -> bool:
+        counted.append(commission_id)
+        return True
+
+    host = make_host(
+        tmp_path,
+        None,
+        task_agent_model=fake_model,
+        decision_llm=FakeDecisionLLM(),
+        runtime_factory=SlowStart,
+        task_agent_meter=meter,
+    )
     hosts.append(host)
     receipt = await _dispatch(host, "sort the photos")
     await asyncio.wait_for(starting.wait(), 5)
@@ -524,6 +592,8 @@ async def test_stopping_while_the_session_comes_up_gives_it_no_work(hosts, tmp_p
 
     assert llm.requests == []
     assert (await host.ledger.get(receipt.commission_id)).status == "cancelled"
+    # Stopped before its first request: none of the free quota went on it.
+    assert counted == []
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +615,10 @@ async def test_question_for_the_user_waits_and_the_answer_goes_back(hosts, tmp_p
     receipt = await _dispatch(host, "sort the photos")
 
     waiting = await wait_status(host, receipt.commission_id, "waiting_user")
-    assert waiting.question() == {"kind": "questions", "questions": questions}
+    question = waiting.question()
+    # (Which question it is: what an answer is read against.)
+    asked_id = question.pop("id")
+    assert asked_id and question == {"kind": "questions", "questions": questions}
     (asked,) = await outbox(host, "question")
     assert asked.payload["task_id"] == receipt.commission_id
     assert asked.payload["question"]["questions"] == questions
@@ -606,7 +679,9 @@ async def test_waiting_report_keeps_the_session_for_the_answer(hosts, tmp_path):
     receipt = await _dispatch(host, "sort the photos")
 
     waiting = await wait_status(host, receipt.commission_id, "waiting_user")
-    assert waiting.question() == {"kind": "report", "question": "Which folder holds the photos?", "details": ""}
+    question = waiting.question()
+    asked_id = question.pop("id")
+    assert asked_id and question == {"kind": "report", "question": "Which folder holds the photos?", "details": ""}
     assert host.task_agents.running == [receipt.commission_id]
     assert len(await outbox(host, "question")) == 1
 
@@ -627,6 +702,16 @@ async def _waiting_and_closed(host: Any, text: str) -> str:
     assert receipt.commission_id not in host.task_agents.running
     assert (await host.ledger.get(receipt.commission_id)).status == "waiting_user"
     return receipt.commission_id
+
+
+async def _waiting_and_closed_after_dispatch(host: Any, commission_id: str) -> str:
+    """Close the idle session of a commission already waiting, as an idle runtime does."""
+    await wait_until(lambda: _ended(host, commission_id), what="the asking run ending")
+    await host.task_agents._runtime.close(commission_id)
+    await host.task_agents.settle()
+    assert commission_id not in host.task_agents.running
+    assert (await host.ledger.get(commission_id)).status == "waiting_user"
+    return commission_id
 
 
 async def test_an_answer_kept_for_a_wake_up_that_never_ran_survives_the_session_closing(hosts, tmp_path):
@@ -654,6 +739,49 @@ async def test_an_answer_kept_for_a_wake_up_that_never_ran_survives_the_session_
     assert {"role": "user", "content": "the photos are in D:/Camera"} in llm.requests[1]
 
 
+
+async def test_an_answer_held_by_a_closing_session_survives_its_runtime_going_away(hosts, tmp_path):
+    # As above, but the runtime process exits before the close comes back:
+    # the session ends as that close would have, and the answer it held is
+    # not lost. The waiting commission is not failed for it either.
+    from nekoclaw.runtime.protocol import PROCESS_EXITED_ERROR
+
+    llm = ScriptedLLM(
+        [
+            _report("waiting", "Which folder holds the photos?"),
+            _report("ready", "sorted D:/Camera"),
+        ]
+    )
+    host = _host(hosts, tmp_path, llm)
+    receipt = await _dispatch(host, "sort the photos")
+    await wait_status(host, receipt.commission_id, "waiting_user")
+    await wait_until(lambda: _ended(host, receipt.commission_id), what="the asking run ending")
+    session = host.task_agents._sessions[receipt.commission_id]
+    session.run_ended = False
+    assert await host.answer(receipt.commission_id, "the photos are in D:/Camera") is True
+    assert session.held_answer == "the photos are in D:/Camera"
+    runtime = host.task_agents._runtime
+    close = runtime.close
+
+    async def unanswered_close(session_id: str) -> None:
+        pass
+
+    # The host asked for the close (a stop, say; an idle runtime closes with
+    # an ordinary closed event instead) and the process went away before
+    # answering.
+    runtime.close = unanswered_close
+    session.closing = True
+    await host.task_agents._handle(
+        {"type": "ended", "session_id": receipt.commission_id, "reason": "error", "error": PROCESS_EXITED_ERROR}
+    )
+    runtime.close = close
+    # Gone from the runtime too, as with its process.
+    await close(receipt.commission_id)
+
+    done = await wait_status(host, receipt.commission_id, "done")
+    assert done.result_summary == "sorted D:/Camera"
+    assert {"role": "user", "content": "the photos are in D:/Camera"} in llm.requests[1]
+
 async def test_an_answer_sent_to_a_session_that_closes_before_taking_it_takes_it_up_again(hosts, tmp_path):
     llm = ScriptedLLM(
         [
@@ -669,7 +797,7 @@ async def test_an_answer_sent_to_a_session_that_closes_before_taking_it_takes_it
     prompt = runtime.prompt
     sent: list[str] = []
 
-    async def lost(session_id: str, text: str) -> None:
+    async def lost(session_id: str, text: str, **_options: Any) -> None:
         # The idle runtime is closing the session: the prompt never lands, and
         # its refusal comes after "closed", when there is no session to fail.
         sent.append(text)
@@ -841,12 +969,14 @@ async def test_what_is_passed_on_while_a_session_starts_follows_its_first_work(h
         "back up the notes": ScriptedLLM([[say("notes backed up"), finish()], [say("ok"), finish()]]),
     }
 
-    def pick(spec: Any) -> ScriptedLLM:
-        return next(llm for text, llm in scripts.items() if text in (spec.instructions or ""))
+    pick = scripts_by_commission(scripts)
 
     host = _host(hosts, tmp_path, pick)
     warm = await _dispatch(host, "warm up")
     await wait_status(host, warm.commission_id, "done")
+    # Its session closed and released before the close is replaced: done is
+    # written before the close is asked for.
+    await wait_until(lambda: warm.commission_id not in host.task_agents._sessions, what="the warm-up session leaving")
     runtime = host.task_agents._runtime
     sent: list[tuple[str, str]] = []
     start, prompt, steer = runtime.start, runtime.prompt, runtime.steer
@@ -856,13 +986,13 @@ async def test_what_is_passed_on_while_a_session_starts_follows_its_first_work(h
         await release.wait()
         return await start(spec)
 
-    async def record_prompt(session_id: str, text: str) -> Any:
+    async def record_prompt(session_id: str, text: str, **options: Any) -> Any:
         sent.append(("prompt", text))
-        return await prompt(session_id, text)
+        return await prompt(session_id, text, **options)
 
-    async def record_steer(session_id: str, text: str) -> Any:
+    async def record_steer(session_id: str, text: str, **options: Any) -> Any:
         sent.append(("steer", text))
-        return await steer(session_id, text)
+        return await steer(session_id, text, **options)
 
     runtime.start, runtime.prompt, runtime.steer = slow_start, record_prompt, record_steer
     second = await _filed(host, "back up the notes")
@@ -874,17 +1004,606 @@ async def test_what_is_passed_on_while_a_session_starts_follows_its_first_work(h
     await wait_status(host, second.id, "working")
     told = await host.task_agents.tell(second.id, "and skip the drafts")
     await host.task_agents._tell_parent(
-        SimpleNamespace(parent_id=second.id, name="agent-9", id="child"), "completed", "drafts listed"
+        SimpleNamespace(parent_id=second.id, name="agent-9", id="child", source="task_agent"), "completed", "drafts listed"
     )
     release.set()
 
     assert told is True
     assert await taking_up is True
     await wait_until(lambda: len(sent) == 3, what="the work and both notes being sent")
-    # Nothing reaches the session before its first work does.
-    assert sent[0] == ("prompt", "put it on drive E:")
+    # Nothing reaches the session before its first work does. It never had a
+    # session, so it starts over, told what the commission is.
+    assert sent[0][0] == "prompt"
+    assert sent[0][1].startswith(f"Commission {second.id}\nback up the notes\n")
+    assert sent[0][1].endswith("\n\nput it on drive E:")
     assert sent[1] == ("steer", "and skip the drafts")
     assert sent[2][0] == "steer" and "drafts listed" in sent[2][1]
+
+
+async def test_what_the_user_added_while_it_was_queued_stays_when_the_quota_is_used_up(hosts, tmp_path):
+    release, wait = _gate()
+    allowed = {"sort the photos": True, "back up the notes": False}
+
+    def pick(spec: Any) -> ScriptedLLM:
+        return ScriptedLLM([[wait, say("done"), finish()]])
+
+    host = _host(hosts, tmp_path, pick, max_task_agents=1)
+
+    async def meter(commission_id: str) -> bool:
+        commission = await host.ledger.get(commission_id)
+        return allowed[commission.dispatch_text]
+
+    host.task_agents._meter = meter
+    first = await _dispatch(host, "sort the photos")
+    await wait_status(host, first.commission_id, "working")
+    second = await _dispatch(host, "back up the notes")
+    # Queued behind the first: what is passed on now (a child's report, a
+    # note) waits for its start.
+    host.task_agents._notes.setdefault(second.commission_id, []).append("skip the drafts")
+    release.set()
+    await wait_status(host, first.commission_id, "done")
+
+    await wait_status(host, second.commission_id, "failed")
+    # Until its session has been released on the host: that is where the
+    # notes of a commission that is not queued would be dropped.
+    await wait_until(lambda: second.commission_id not in host.task_agents._sessions, what="the session being released")
+    await host.task_agents.settle()
+
+    # Kept for when it is taken up again, as when the quota ran out before
+    # anything was started.
+    assert host.task_agents._carried.get(second.commission_id) == ["skip the drafts"]
+
+
+async def test_the_sentence_a_start_was_given_stays_when_the_quota_is_used_up(hosts, tmp_path):
+    # Taken up again with the user's answer, and the quota is used up: the
+    # answer is kept for the next time, not only recorded in the ledger.
+    llm = ScriptedLLM([[say("photos sorted"), finish()]])
+    host = _host(hosts, tmp_path, lambda spec: llm)
+    paid = [False, True]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _filed(host, "sort the photos")
+    await host.ledger.transition(commission.id, "working", reason="test")
+    await host.ledger.transition(commission.id, "blocked", reason="test")
+
+    # Not delivered: the start it took was given up.
+    assert await host.task_agents.tell(commission.id, "the photos are on drive E:") is False
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    await host.task_agents.settle()
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:"]
+
+    assert await host.task_agents.tell(commission.id, "try again") is True
+    await wait_status(host, commission.id, "done", timeout=10)
+    sent = " | ".join(str(message.get("content")) for message in llm.requests[0])
+    # In the order they were said: the kept answer before the newer sentence.
+    assert sent.index("the photos are on drive E:") < sent.index("try again")
+
+
+async def test_a_start_given_up_for_the_quota_keeps_its_place_until_its_session_is_closed(hosts, tmp_path):
+    # The user takes the failed commission up again while its old session is
+    # still closing. The new session waits for the old one to go; the old
+    # one's close must not release it.
+    paid = [True, False, True]
+    pick = lambda spec: ScriptedLLM([[say("done"), finish()]])  # noqa: E731
+    host = _host(hosts, tmp_path, pick)
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    warm = await _dispatch(host, "warm up")
+    await wait_status(host, warm.commission_id, "done")
+    # Its session closed and released before the close is replaced: done is
+    # written before the close is asked for.
+    await wait_until(lambda: warm.commission_id not in host.task_agents._sessions, what="the warm-up session leaving")
+    runtime = host.task_agents._runtime
+    close = runtime.close
+    release = asyncio.Event()
+
+    async def slow_close(session_id: str) -> None:
+        await release.wait()
+        await close(session_id)
+
+    runtime.close = slow_close
+    first = await _dispatch(host, "sort the photos")
+    await wait_status(host, first.commission_id, "failed")
+    # Taken up again while the old session is still closing.
+    told = asyncio.ensure_future(host.task_agents.tell(first.commission_id, "try again"))
+    await asyncio.sleep(0.05)
+    release.set()
+    assert await told is True
+
+    await wait_status(host, first.commission_id, "done", timeout=10)
+
+
+async def test_a_closing_session_whose_runtime_went_away_is_released(hosts, tmp_path):
+    # Given up for the quota, its session waits for its close; the runtime
+    # process exits before answering, which ends the session with an error.
+    paid = [True, False, True]
+    pick = lambda spec: ScriptedLLM([[say("done"), finish()]])  # noqa: E731
+    host = _host(hosts, tmp_path, pick)
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    warm = await _dispatch(host, "warm up")
+    await wait_status(host, warm.commission_id, "done")
+    # Its session closed and released before the close is replaced: done is
+    # written before the close is asked for.
+    await wait_until(lambda: warm.commission_id not in host.task_agents._sessions, what="the warm-up session leaving")
+    runtime = host.task_agents._runtime
+    close = runtime.close
+    closes: list[str] = []
+
+    async def unanswered_close(session_id: str) -> None:
+        closes.append(session_id)
+
+    runtime.close = unanswered_close
+    first = await _dispatch(host, "sort the photos")
+    await wait_status(host, first.commission_id, "failed")
+    await wait_until(lambda: closes == [first.commission_id], what="the close being asked for")
+    host.task_agents._notes.setdefault(first.commission_id, []).append("skip the drafts")
+    assert first.commission_id in host.task_agents._sessions
+
+    await host.task_agents._handle(
+        {"type": "ended", "session_id": first.commission_id, "reason": "error", "error": "the runtime process exited"}
+    )
+
+    assert first.commission_id not in host.task_agents._sessions
+    assert host.task_agents._notes.get(first.commission_id) == ["skip the drafts"]
+    # Gone from the runtime as with its process (the in-process runtime
+    # stands in for it); what it says now finds no session.
+    runtime.close = close
+    await close(first.commission_id)
+    await host.task_agents.settle()
+    assert await host.task_agents.tell(first.commission_id, "try again") is True
+    await wait_status(host, first.commission_id, "done", timeout=10)
+
+
+async def test_a_closing_session_that_ends_with_an_ordinary_error_waits_for_its_close(hosts, tmp_path):
+    # A run can end with an error while its session is closing; the close's
+    # own end follows. Releasing on the error would let that end release a
+    # session the user started again meanwhile.
+    pick = lambda spec: ScriptedLLM([[say("done"), finish()]])  # noqa: E731
+    host = _host(hosts, tmp_path, pick)
+    paid = [True, False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    warm = await _dispatch(host, "warm up")
+    await wait_status(host, warm.commission_id, "done")
+    # Its session closed and released before the close is replaced: done is
+    # written before the close is asked for.
+    await wait_until(lambda: warm.commission_id not in host.task_agents._sessions, what="the warm-up session leaving")
+    runtime = host.task_agents._runtime
+    close = runtime.close
+
+    close_requested = asyncio.Event()
+
+    async def unanswered_close(session_id: str) -> None:
+        close_requested.set()
+
+    runtime.close = unanswered_close
+    first = await _dispatch(host, "sort the photos")
+    await wait_status(host, first.commission_id, "failed")
+    # Failed is written before the close is asked for; the session is
+    # closing only from then on.
+    await wait_until(close_requested.is_set, what="the close being asked for")
+
+    await host.task_agents._handle(
+        {"type": "ended", "session_id": first.commission_id, "reason": "error", "error": "the model failed"}
+    )
+
+    # Still waiting for its close.
+    assert first.commission_id in host.task_agents._sessions
+    runtime.close = close
+    await close(first.commission_id)
+    await wait_until(lambda: first.commission_id not in host.task_agents._sessions, what="the close's own end")
+
+
+
+@pytest.mark.parametrize("how", ["reports", "raises"])
+async def test_what_a_quota_failure_kept_survives_a_start_that_cannot_open_its_session(hosts, tmp_path, how):
+    llm = ScriptedLLM([[say("photos sorted"), finish()]])
+    host = _host(hosts, tmp_path, lambda spec: llm)
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _filed(host, "sort the photos")
+    await host.ledger.transition(commission.id, "working", reason="test")
+    await host.ledger.transition(commission.id, "blocked", reason="test")
+    assert await host.task_agents.tell(commission.id, "the photos are on drive E:") is False
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    runtime = host.task_agents._runtime
+    start = runtime.start
+
+    async def broken_start(spec: Any) -> None:
+        if how == "raises":
+            raise RuntimeError("the runtime process could not be created")
+        # What the process runtime does: the start returns, and an error
+        # event for the start follows.
+        await host.task_agents._handle(
+            {"type": "error", "session_id": spec.session_id, "command": "start", "message": "could not open"}
+        )
+
+    runtime.start = broken_start
+    assert await host.task_agents.tell(commission.id, "try again") is False
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the failed start being given up")
+
+    # Kept for the start after this one with what this one was given, in
+    # the order they came.
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:", "try again"]
+    runtime.start = start
+    assert await host.task_agents.tell(commission.id, "once more") is True
+    await wait_status(host, commission.id, "done", timeout=10)
+    sent = " | ".join(str(message.get("content")) for message in llm.requests[0])
+    assert sent.index("the photos are on drive E:") < sent.index("try again") < sent.index("once more")
+
+
+
+
+async def _kept_after_a_quota_failure(host: Any) -> Any:
+    """File a blocked commission, take it up with the user's answer, and let the quota fail it."""
+    commission = await _filed(host, "sort the photos")
+    await host.ledger.transition(commission.id, "working", reason="test")
+    await host.ledger.transition(commission.id, "blocked", reason="test")
+    assert await host.task_agents.tell(commission.id, "the photos are on drive E:") is False
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:"]
+    return commission
+
+
+async def test_kept_text_survives_a_start_the_runtime_gives_up_after_the_prompt_was_written(hosts, tmp_path):
+    # Writing the prompt is not the session taking it: the runtime process can
+    # still answer the start with an error (it went away before confirming).
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+    runtime = host.task_agents._runtime
+    prompt = runtime.prompt
+
+    async def prompt_then_gone(session_id: str, text: str, **_options: Any) -> None:
+        async def later() -> None:
+            # After the prompt was written: the start's own answer, then the
+            # process going away before the start was confirmed.
+            await asyncio.sleep(0.01)
+            await host.task_agents._handle({"type": "started", "session_id": session_id})
+            await host.task_agents._handle(
+                {"type": "error", "session_id": session_id, "command": "start", "message": "the runtime process exited"}
+            )
+
+        asyncio.get_running_loop().create_task(later())
+
+    runtime.prompt = prompt_then_gone
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    runtime.prompt = prompt
+
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:", "try again"]
+
+
+
+async def test_kept_text_reaches_the_model_once_after_a_run_that_failed_on_its_first_request(hosts, tmp_path):
+    # The run takes its prompt into the transcript before the model fails
+    # (a 500, a 429, the network); the next start goes on from it.
+    async def failing_model() -> None:
+        raise RuntimeError("the model failed")
+
+    llm = ScriptedLLM([[failing_model], [say("done"), finish()]])
+    host = _host(hosts, tmp_path, lambda spec: llm)
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    assert commission.id not in host.task_agents._carried
+
+    await host.task_agents.tell(commission.id, "once more")
+    await wait_until(lambda: len(llm.requests) == 2, what="the next run's model request")
+
+    said = [message["content"] for message in llm.requests[-1] if message["role"] == "user"]
+    assert sum("the photos are on drive E:" in text for text in said) == 1
+    assert any("once more" in text for text in said)
+
+
+async def test_kept_text_survives_the_runtime_going_away_before_the_prompt_was_sent(hosts, tmp_path):
+    # The runtime process exits after the start was answered and before the
+    # prompt went out (here while the first request is being counted): the
+    # run ends with an error, and nothing reached the transcript.
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        if paid:
+            return paid.pop(0)
+        await host.task_agents._handle(
+            {"type": "ended", "session_id": commission_id, "reason": "error", "error": "the runtime process exited"}
+        )
+        return True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:", "try again"]
+    # Nothing of the work was taken: she is told it did not start, not that it stopped partway.
+    assert (await host.ledger.get(commission.id)).status_reason == "the runtime process exited"
+    report = (await outbox(host, "task_result"))[-1]
+    told, shown = _failed("start", "en", "the runtime process exited")
+    assert (report.payload["summary"], report.payload["text"]) == (told, shown)
+
+
+async def test_what_is_passed_on_while_a_run_that_ended_before_its_prompt_is_failed_comes_after_it(hosts, tmp_path):
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        if paid:
+            return paid.pop(0)
+        await host.task_agents._handle(
+            {"type": "ended", "session_id": commission_id, "reason": "error", "error": "the runtime process exited"}
+        )
+        return True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+    fail = host.task_agents._fail
+
+    async def fail_with_a_word_meanwhile(commission_id: str, reason: str, **said: Any) -> None:
+        await host.task_agents.tell(commission_id, "and drive F: too")
+        await fail(commission_id, reason, **said)
+
+    host.task_agents._fail = fail_with_a_word_meanwhile
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    host.task_agents._fail = fail
+
+    assert host.task_agents._carried.get(commission.id) == [
+        "the photos are on drive E:",
+        "try again",
+        "and drive F: too",
+    ]
+
+
+async def test_what_a_failed_first_start_held_reaches_a_start_taken_up_while_the_failure_is_written(hosts, tmp_path):
+    # The first start of a commission gives its place back before its failure
+    # is written; the user's next words then take the commission up again
+    # while that is under way. What the failed start held must be kept by then.
+    llm = ScriptedLLM([[say("done"), finish()]])
+    host = _host(hosts, tmp_path, lambda spec: llm)
+    commission = await _filed(host, "sort the photos")
+    host.task_agents._notes[commission.id] = ["the photos are on drive E:"]
+    model_config = host.task_agents._model_config
+    fail = host.task_agents._fail
+
+    async def no_model_once() -> dict[str, Any]:
+        host.task_agents._model_config = model_config
+        raise RuntimeError("no model is configured for task agents")
+
+    async def fail_then_spoken_to(commission_id: str, reason: str, **said: Any) -> None:
+        host.task_agents._fail = fail
+        await fail(commission_id, reason, **said)
+        await host.task_agents.tell(commission_id, "once more")
+        await wait_until(lambda: len(llm.requests) == 1, what="the next start's model request")
+
+    host.task_agents._model_config = no_model_once
+    host.task_agents._fail = fail_then_spoken_to
+    await host.task_agents.submit(commission)
+    await wait_status(host, commission.id, "done", timeout=10)
+
+    sent = " | ".join(str(message.get("content")) for message in llm.requests[0])
+    assert sent.index("the photos are on drive E:") < sent.index("once more")
+
+
+async def test_the_sentence_of_a_start_that_fails_while_it_is_set_up_is_kept(hosts, tmp_path):
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+    model_config = host.task_agents._model_config
+
+    async def no_model() -> dict[str, Any]:
+        return {}
+
+    host.task_agents._model_config = no_model
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    host.task_agents._model_config = model_config
+
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:", "try again"]
+
+
+async def test_what_was_passed_on_while_a_start_was_set_up_is_kept_when_its_prompt_is_refused_later(hosts, tmp_path):
+    # The process runtime answers a prompt it refuses with an event that comes
+    # after the prompt call returned, by when what came meanwhile was steered.
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+    runtime = host.task_agents._runtime
+    start, prompt, steer = runtime.start, runtime.prompt, runtime.steer
+    steered: list[str] = []
+    serials: dict[str, Any] = {}
+    sessions: list[Any] = []
+
+    async def start_with_a_note(spec: Any) -> None:
+        await start(spec)
+        await host.task_agents.tell(spec.session_id, "and drive F: too")
+
+    async def refused_later(session_id: str, text: str, **options: Any) -> None:
+        serials["prompt"] = options["serial"]
+        sessions.append(host.task_agents._sessions[commission.id])
+
+        async def later() -> None:
+            await asyncio.sleep(0.01)
+            # Refused by the number it was sent under, as a runtime says it.
+            await host.task_agents._handle(
+                {
+                    "type": "error",
+                    "session_id": session_id,
+                    "command": "prompt",
+                    "message": "a run is under way",
+                    "serial": options["serial"],
+                }
+            )
+
+        asyncio.get_running_loop().create_task(later())
+
+    async def record_steer(session_id: str, text: str, **options: Any) -> None:
+        serials["steer"] = options["serial"]
+        steered.append(text)
+
+    runtime.start, runtime.prompt, runtime.steer = start_with_a_note, refused_later, record_steer
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    runtime.start, runtime.prompt, runtime.steer = start, prompt, steer
+
+    assert steered == ["and drive F: too"]
+    # The opening text is out of the count, and the note sent after it is the first now.
+    [session] = sessions
+    assert session.numbered == {serials["steer"]: 1} and session.sent == 1
+    assert host.task_agents._carried.get(commission.id) == [
+        "the photos are on drive E:",
+        "try again",
+        "and drive F: too",
+    ]
+
+
+async def test_kept_text_survives_a_prompt_the_runtime_refuses(hosts, tmp_path):
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+    runtime = host.task_agents._runtime
+    prompt = runtime.prompt
+
+    async def refused(session_id: str, text: str, **_options: Any) -> None:
+        await host.task_agents._handle(
+            {"type": "error", "session_id": session_id, "command": "prompt", "message": "a run is under way"}
+        )
+
+    runtime.prompt = refused
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    runtime.prompt = prompt
+
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:", "try again"]
+
+
+async def test_a_start_that_fails_after_its_commission_was_stopped_keeps_nothing(hosts, tmp_path):
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+    runtime = host.task_agents._runtime
+    start = runtime.start
+
+    async def stopped_then_failed(spec: Any) -> None:
+        await host.ledger.transition(spec.session_id, "cancelled", reason="test")
+        await host.task_agents.abort(spec.session_id)
+        await host.task_agents._handle(
+            {"type": "error", "session_id": spec.session_id, "command": "start", "message": "could not open"}
+        )
+
+    runtime.start = stopped_then_failed
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+    runtime.start = start
+
+    assert commission.id not in host.task_agents._carried
+
+
+async def test_kept_text_is_not_kept_again_once_the_session_was_at_work_on_it(hosts, tmp_path):
+    async def failing_model() -> None:
+        raise RuntimeError("the model failed")
+
+    # The run says something, then fails: what it was given had been taken.
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("looking"), failing_model]]))
+    paid = [False]
+
+    async def meter(commission_id: str) -> bool:
+        return paid.pop(0) if paid else True
+
+    host.task_agents._meter = meter
+    commission = await _kept_after_a_quota_failure(host)
+
+    await host.task_agents.tell(commission.id, "try again")
+    await wait_status(host, commission.id, "failed")
+    await host.task_agents.settle()
+
+    assert "the photos are on drive E:" not in host.task_agents._carried.get(commission.id, [])
+
+
+async def test_what_is_passed_on_while_a_quota_failure_is_written_comes_before_the_next_sentence(hosts, tmp_path):
+    host = _host(hosts, tmp_path, lambda spec: ScriptedLLM([[say("done"), finish()]]))
+
+    async def meter(commission_id: str) -> bool:
+        return False
+
+    host.task_agents._meter = meter
+    fail = host.task_agents._fail
+
+    async def fail_while_told(commission_id: str, reason: str, **said: Any) -> None:
+        # The user adds something while the failure is being written.
+        host.task_agents._notes.setdefault(commission_id, []).append("and skip the drafts")
+        await fail(commission_id, reason, **said)
+
+    host.task_agents._fail = fail_while_told
+    commission = await _filed(host, "sort the photos")
+    await host.ledger.transition(commission.id, "working", reason="test")
+    await host.ledger.transition(commission.id, "blocked", reason="test")
+    assert await host.task_agents.tell(commission.id, "the photos are on drive E:") is False
+    await wait_status(host, commission.id, "failed")
+    await wait_until(lambda: commission.id not in host.task_agents._sessions, what="the session being released")
+
+    assert host.task_agents._carried.get(commission.id) == ["the photos are on drive E:", "and skip the drafts"]
+    assert not host.task_agents._notes.get(commission.id)
 
 
 async def test_an_untaken_answer_ends_as_failed_when_shutting_down_begins_while_it_goes_back(hosts, tmp_path):
@@ -901,7 +1620,7 @@ async def test_an_untaken_answer_ends_as_failed_when_shutting_down_begins_while_
     runtime = host.task_agents._runtime
     prompt = runtime.prompt
 
-    async def lost(session_id: str, text: str) -> None:
+    async def lost(session_id: str, text: str, **_options: Any) -> None:
         return None
 
     runtime.prompt = lost
@@ -945,7 +1664,10 @@ async def test_a_refused_wake_up_hands_over_the_kept_answer(hosts, tmp_path):
     assert await host.answer(receipt.commission_id, "the photos are in D:/Camera") is True
 
     # The runtime refuses the steer that was to wake it: no run starts.
-    await host.task_agents._on_error(session, {"type": "error", "command": "steer", "message": "refused"})
+    from nekoclaw.host.task_agents import _refusal
+
+    refusal = {"type": "error", "command": "steer", "message": "refused"}
+    await host.task_agents._on_error(session, refusal, _refusal(session, refusal))
 
     done = await wait_status(host, receipt.commission_id, "done")
     assert done.result_summary == "sorted D:/Camera"
@@ -958,8 +1680,7 @@ async def test_two_sentences_at_once_for_a_commission_with_no_place_are_queued_t
         "back up the notes": ScriptedLLM([[say("notes backed up"), finish()]]),
     }
 
-    def pick(spec: Any) -> ScriptedLLM:
-        return next(llm for text, llm in scripts.items() if text in (spec.instructions or ""))
+    pick = scripts_by_commission(scripts)
 
     host = _host(hosts, tmp_path, pick, max_task_agents=1)
     first = await _dispatch(host, "sort the photos")
@@ -1001,6 +1722,37 @@ async def test_an_answer_after_the_idle_session_was_closed_takes_it_up_again(hos
     assert {"role": "user", "content": "the photos are in D:/Camera"} in llm.requests[1]
     (_first, again) = await _events(host, commission_id, "started")
     assert again.payload["resumed"] is True
+
+
+async def test_a_session_answer_outlives_the_idle_session_being_closed(hosts, tmp_path):
+    # "For this session" lasts the whole commission (owner, 2026-11-13): the
+    # idle runtime closing the session and the commission being taken up
+    # again in a new one keeps what the user allowed.
+    llm = ScriptedLLM(
+        [
+            _report("waiting", "Which folder holds the photos?"),
+            _report("ready", "sorted D:/Camera"),
+        ]
+    )
+    host = _host(hosts, tmp_path, llm)
+
+    async def asker(commission_id: str, ask: Any) -> str:
+        return "session"
+
+    host.permissions.set_asker(asker)
+    receipt = await _dispatch(host, "sort the photos")
+    await wait_status(host, receipt.commission_id, "waiting_user")
+    assert (await host.permissions.check(receipt.commission_id, "run_command")).allow
+    commission_id = await _waiting_and_closed_after_dispatch(host, receipt.commission_id)
+    assert host.permissions.session_grants(commission_id) == {("run_command", None)}
+
+    assert await host.answer(commission_id, "the photos are in D:/Camera") is True
+    await wait_until(lambda: commission_id in host.task_agents.running, what="the new session")
+    assert host.permissions.session_grants(commission_id) == {("run_command", None)}
+
+    await wait_status(host, commission_id, "done")
+    # Done: gone.
+    assert host.permissions.session_grants(commission_id) == frozenset()
 
 
 async def test_taking_up_again_outlives_a_caller_cancelled_meanwhile(hosts, tmp_path):
@@ -1052,8 +1804,7 @@ async def test_an_answer_told_after_the_idle_session_was_closed_waits_for_a_plac
         "back up the notes": ScriptedLLM([[wait, say("notes backed up"), finish()]]),
     }
 
-    def pick(spec: Any) -> ScriptedLLM:
-        return next(llm for text, llm in scripts.items() if text in (spec.instructions or ""))
+    pick = scripts_by_commission(scripts)
 
     host = _host(hosts, tmp_path, pick, max_task_agents=1)
     commission_id = await _waiting_and_closed(host, "sort the photos")
@@ -1122,7 +1873,7 @@ async def test_permission_once_allows_the_request_and_asks_again_next_time(hosts
     question = waiting.question()
     assert question["kind"] == "permission"
     assert question["category"] == "outside_write"
-    assert question["options"] == ["once", "always", "deny"]
+    assert question["options"] == ["always", "session", "once", "deny"]
     assert question["detail"]["path"] == str(tmp_path / "one.txt")
     assert not (tmp_path / "one.txt").exists()
 
@@ -1228,7 +1979,7 @@ async def test_stopping_while_it_waits_for_an_answer(hosts, tmp_path):
 
 
 def _note(category: str, title: str, content: str, call_id: str = "n1") -> list[Any]:
-    arguments = {"title": title, "content": content, "category": category}
+    arguments = {"title": title, "content": content, "category": category, "confidence": "verified"}
     return [call("note_lesson", arguments, call_id), finish("tool_calls")]
 
 
@@ -1257,7 +2008,7 @@ async def test_feedback_becomes_a_task_preference_after_the_second_time(hosts, t
 
 
 @pytest.mark.parametrize("category", ["lesson", "reflection", "reference", "progress"])
-async def test_other_lessons_go_to_the_lesson_sink(hosts, tmp_path, category):
+async def test_other_lessons_go_to_the_task_agent_space(hosts, tmp_path, category):
     llm = ScriptedLLM([_note(category, "Photo dates", "EXIF dates are more reliable than file dates"), _report("ready", "done")])
     host = _host(hosts, tmp_path, llm)
 
@@ -1268,7 +2019,9 @@ async def test_other_lessons_go_to_the_lesson_sink(hosts, tmp_path, category):
     assert lesson.payload["category"] == category
     assert lesson.payload["title"] == "Photo dates"
     assert await host.preferences.list() == []
-    assert "lesson submitted. recorded" in llm.requests[1][-1]["content"]
+    assert "lesson submitted. kept in project _daily as photo-dates.md" in llm.requests[1][-1]["content"]
+    (entry,) = await host.space.list_entries("_daily")
+    assert (entry.title, entry.type, entry.sources) == ("Photo dates", category, (receipt.commission_id,))
 
 
 async def test_lesson_sink_can_be_replaced(hosts, tmp_path):
@@ -1286,7 +2039,7 @@ async def test_lesson_sink_can_be_replaced(hosts, tmp_path):
     await wait_status(host, receipt.commission_id, "done")
 
     assert received == [
-        (receipt.commission_id, {"title": "Photo dates", "content": "Use EXIF dates", "category": "lesson", "scope": "project"})
+        (receipt.commission_id, {"title": "Photo dates", "content": "Use EXIF dates", "category": "lesson", "scope": "project", "confidence": "verified", "evidence": []})
     ]
 
 
@@ -1312,6 +2065,9 @@ async def test_web_search_runs_the_search_plugin(hosts, tmp_path):
     runner = _SearchRunner()
     host.task_agents._runner = runner
     commission = await _filed(host, "look up the weather")
+    # As a session at work on the commission asks: a runtime names the session.
+    await host.task_agents._give_session(commission)
+    assert host.task_agents._take_place(commission.id)
 
     result = await host.task_agents._cb_web_search(commission.id, {"queries": ["weather tomorrow"]})
 
@@ -1429,8 +2185,7 @@ async def test_addition_for_a_queued_commission_goes_along_when_it_starts(hosts,
         "back up the notes": ScriptedLLM([[say("notes backed up"), finish()]]),
     }
 
-    def pick(spec: Any) -> ScriptedLLM:
-        return next(llm for text, llm in scripts.items() if text in (spec.instructions or ""))
+    pick = scripts_by_commission(scripts)
 
     host = _host(hosts, tmp_path, pick, max_task_agents=1)
     first = await _dispatch(host, "sort the photos")
@@ -1443,8 +2198,8 @@ async def test_addition_for_a_queued_commission_goes_along_when_it_starts(hosts,
     await wait_status(host, second.commission_id, "done")
 
     request = scripts["back up the notes"].requests[0]
-    assert request[-1]["content"].startswith("back up the notes")
-    assert "put the backup on drive E:" in request[-1]["content"]
+    assert request[-1]["content"].startswith(f"Commission {second.commission_id}\nback up the notes\n")
+    assert request[-1]["content"].endswith("\n\nput the backup on drive E:")
 
 
 # ---------------------------------------------------------------------------
@@ -1482,6 +2237,48 @@ async def test_an_answer_while_a_child_result_keeps_the_parent_busy_waits_for_th
     assert {"role": "user", "content": "by month"} in parent.requests[3]
 
 
+async def test_a_child_that_fails_for_the_host_tells_its_parent_the_reason_on_record(hosts, tmp_path):
+    parent_release, parent_wait = _gate()
+    parent = ScriptedLLM(
+        [
+            [call("subagent", {"description": "count the files", "prompt": "Count the files in the folder."}), finish("tool_calls")],
+            # Held until the child has failed, so its result is in the next request.
+            [parent_wait, call("list_agents", {}, "c2"), finish("tool_calls")],
+            _report("ready", "the count failed"),
+        ]
+    )
+    child = ScriptedLLM([[say("3 files"), finish()]])
+    lead: list[str] = []
+
+    async def meter(commission_id: str) -> bool:
+        # The parent's requests are counted; the child has nothing left.
+        lead[:1] = lead[:1] or [commission_id]
+        return commission_id == lead[0]
+
+    host = _host(hosts, tmp_path, lambda spec: parent if spec.top_level else child, task_agent_meter=meter)
+
+    receipt = await _dispatch(host, "tell me how many files are in the folder", lang="ja")
+
+    await wait_until(lambda: _children(host, receipt.commission_id), what="the child task agent being filed")
+    (sub,) = await host.ledger.select(parent_id=receipt.commission_id)
+    await wait_status(host, sub.id, "failed")
+    # The failure is on record before the parent is told: released only once
+    # the result has gone to its session (sent there in the same step as it
+    # is counted), so the parent's next request has it.
+    parent_session = host.task_agents._sessions[receipt.commission_id]
+    await wait_until(lambda: parent_session.sent >= 2, what="the child's result being sent to the parent")
+    parent_release.set()
+    await wait_status(host, receipt.commission_id, "done")
+    # What a parent is told is not for the user: the reason as it is on record, untranslated.
+    told = json.dumps(parent.requests[-1], ensure_ascii=False).replace("\\n", "\n")
+    # (Framed by the host, as everything a task agent hands back is: indented between two marker lines.)
+    assert "[child task agent agent-1 finished: failed]" in told
+    assert "\n    the task agent's model ran out of quota\n" in told
+    assert TASK_AGENT_FAILED_WHY["quota"] not in told
+    # Only the commission she gave is reported to her.
+    assert [report.payload["task_id"] for report in await outbox(host, "task_result")] == [receipt.commission_id]
+
+
 async def test_child_task_agent_runs_under_its_parent_and_reports_back_to_it(hosts, tmp_path):
     parent = ScriptedLLM(
         [
@@ -1509,11 +2306,29 @@ async def test_child_task_agent_runs_under_its_parent_and_reports_back_to_it(hos
     assert sub.lanlan_name == "Lan"
     # The child got its part as its work and may not start task agents itself.
     child_spec = next(spec for spec in specs if not spec.top_level)
-    assert child_spec.disabled_tools == ["subagent"]
-    assert child.requests[0][-1]["content"] == "Count the files in the folder."
+    assert sorted(child_spec.disabled_tools) == ["ask_session", "message_session", "schedule_wake", "subagent"]
+    assert child.requests[0][-1]["content"].startswith("Your part: count the files\nCount the files in the folder.")
+    assert "another task agent" in child.requests[0][0]["content"]
+    assert "You work for Lan" not in child.requests[0][0]["content"]
+    # It has a session of its own, whose parent is the session of the one that started it.
+    child_session = await host.ledger.get_session(sub.session_id)
+    assert (child_session.id, child_session.kind, child_session.parent_id) == (sub.id, "child", receipt.commission_id)
+    assert child_session.name.endswith("/agent-1")
     assert "subagent" not in [tool["function"]["name"] for tool in child.overrides[0].get("tools", [])]
     # Its result came back to the parent as a message, and the parent listed it.
-    assert "[child task agent agent-1 finished: completed]\n3 files" in json.dumps(parent.requests[2], ensure_ascii=False).replace("\\n", "\n")
+    [handed_back] = [
+        str(message["content"])
+        for message in parent.requests[2]
+        if message.get("role") == "user" and "child task agent agent-1 finished" in str(message.get("content"))
+    ]
+    # In a frame of the host's, every line of it indented: it is what a model wrote.
+    # Both lines of the frame are in that one message, with the marker its opening names.
+    import re
+
+    marker = f"======== {re.search(r'marked ([0-9a-f]{16})', handed_back).group(1)} ========"
+    opened, inside, after = handed_back.split(marker)
+    assert opened.startswith("[child task agent agent-1 finished: completed] What it handed back is between")
+    assert (inside, after) == ("\n    3 files\n", "")
     listing = next(message["content"] for message in parent.requests[2] if message.get("role") == "tool" and "lead" in str(message.get("content")))
     assert listing.startswith("lead [working]")
     assert "agent-1 [" in listing
@@ -1523,6 +2338,34 @@ async def test_child_task_agent_runs_under_its_parent_and_reports_back_to_it(hos
     # And a query lists her commission, not its child task agent.
     view = await host.query("", lanlan_name="Lan", lang="en")
     assert [item.id for item in view.commissions] == [receipt.commission_id]
+
+
+async def test_what_a_task_agent_hands_to_one_it_starts_reaches_it_whole(hosts, tmp_path):
+    from config.nekoclaw_settings import TASK_AGENT_BRIEF_MAX_TOKENS
+    from utils.tokenize import count_tokens
+
+    steps = " ".join(f"Then check file number {index} against the list." for index in range(900))
+    handed = f"Count the files in the folder. {steps} Last of all, answer with the word DONE."
+    # Longer than what the opening message of one of her commissions is held to.
+    assert count_tokens(handed) > 2 * TASK_AGENT_BRIEF_MAX_TOKENS
+    parent = ScriptedLLM(
+        [
+            [call("subagent", {"description": "count the files", "prompt": handed}), finish("tool_calls")],
+            [call("wait_agent", {"timeout_ms": 600_000}, "c2"), finish("tool_calls")],
+            _report("ready", "counted"),
+        ]
+    )
+    child = ScriptedLLM([[say("DONE"), finish()]])
+    host = _host(hosts, tmp_path, lambda spec: parent if spec.top_level else child)
+
+    receipt = await _dispatch(host, "tell me how many files are in the folder")
+
+    await wait_status(host, receipt.commission_id, "done")
+    # All of it: it is all the other one is told of its part, and the task agent that wrote
+    # it was told that the other was started.
+    opening = child.requests[0][-1]["content"]
+    assert opening.startswith(f"Your part: count the files\n{handed}")
+    assert opening.endswith(REPLY_LANGUAGE_SENTENCE.replace("<<LANGUAGE>>", "English"))
 
 
 @pytest.mark.parametrize("where", ["outside", "inside"])
@@ -1750,9 +2593,9 @@ async def test_a_result_for_a_parent_back_at_work_while_it_was_looked_up_is_stee
     steered: list[str] = []
     steer = runtime.steer
 
-    async def record(session_id: str, text: str) -> Any:
+    async def record(session_id: str, text: str, **options: Any) -> Any:
         steered.append(text)
-        return await steer(session_id, text)
+        return await steer(session_id, text, **options)
 
     runtime.steer = record
 
@@ -1764,7 +2607,10 @@ async def test_a_result_for_a_parent_back_at_work_while_it_was_looked_up_is_stee
     release.set()
 
 
-async def test_parent_does_not_wait_for_a_child_that_reported_blocked(hosts, tmp_path):
+@pytest.mark.parametrize("ledger", ["readable", "unreadable for a moment as the child is looked for"])
+async def test_parent_does_not_wait_for_a_child_that_reported_blocked(hosts, tmp_path, monkeypatch, ledger):
+    from nekoclaw.host.ledger import ACTIVE_STATUSES
+
     parent = ScriptedLLM(
         [
             [call("subagent", {"description": "open the vault", "prompt": "Open the vault."}), finish("tool_calls")],
@@ -1775,8 +2621,37 @@ async def test_parent_does_not_wait_for_a_child_that_reported_blocked(hosts, tmp
     )
     child = ScriptedLLM([_report("blocked", "the vault needs a key"), [say("waiting"), finish()]])
     host = _host(hosts, tmp_path, lambda spec: parent if spec.top_level else child)
+    select, act = host.ledger.select, host.task_agents._act_on_end
+    ending: list[str] = []
+    failed: list[int] = []
+    the_parent: list[str] = []
+
+    async def acting(session: Any, event: dict[str, Any]) -> None:
+        ending.append(session.commission_id)
+        try:
+            await act(session, event)
+        finally:
+            ending.pop()
+
+    async def unreadable_once(*args: Any, **asked: Any) -> Any:
+        # What the parent started that is to end with it: read as the end of its run is acted
+        # on, once its own end is written.
+        if (
+            ledger != "readable"
+            and not failed
+            and ending
+            and the_parent == [ending[-1]] == [asked.get("parent_id")]
+            and asked.get("statuses") == ACTIVE_STATUSES
+        ):
+            failed.append(1)
+            raise OSError("the disk is busy")
+        return await select(*args, **asked)
+
+    monkeypatch.setattr(host.task_agents, "_act_on_end", acting)
+    monkeypatch.setattr(host.ledger, "select", unreadable_once)
 
     receipt = await _dispatch(host, "tidy up and open the vault")
+    the_parent.append(receipt.commission_id)
 
     # The blocked child has reported and produces nothing more, so the parent
     # is done rather than left working with its place held.
@@ -1787,6 +2662,8 @@ async def test_parent_does_not_wait_for_a_child_that_reported_blocked(hosts, tmp
     await wait_until(lambda: _child_status(host, receipt.commission_id, "cancelled"), what="the child being closed")
     (sub,) = await host.ledger.select(parent_id=receipt.commission_id)
     assert (sub.status, sub.status_reason) == ("cancelled", "its parent finished")
+    # (Asked again where the ledger could not be read at once: the child is not left as it was.)
+    assert bool(failed) == (ledger != "readable")
 
 
 async def test_a_parent_woken_by_a_result_is_not_ended_by_its_earlier_run(hosts, tmp_path):
@@ -1918,8 +2795,7 @@ async def test_a_retry_waiting_for_a_place_can_be_stopped(hosts, tmp_path):
         "back up the notes": ScriptedLLM([[say("notes backed up"), finish()]]),
     }
 
-    def pick(spec: Any) -> ScriptedLLM:
-        return next(llm for text, llm in scripts.items() if text in (spec.instructions or ""))
+    pick = scripts_by_commission(scripts)
 
     host = _host(hosts, tmp_path, pick, max_task_agents=1)
     first = await _dispatch(host, "sort the photos")
@@ -2070,3 +2946,914 @@ async def test_starting_a_queued_commission_does_not_hold_up_runtime_events(tmp_
     may_start.set()
     done = await wait_status(host, second.id, "done")
     assert done.result_summary == "done"
+
+
+# ---------------------------------------------------------------------------
+# Pictures, the desktop and the browser
+# ---------------------------------------------------------------------------
+
+
+class RecordingRuntime:
+    """A runtime that opens no session: it records what it is told and says what a test has it say."""
+
+    def __init__(self, on_event: Any, callbacks: Any) -> None:
+        del callbacks
+        self._on_event = on_event
+        self.specs: list[Any] = []
+        self.sent: list[tuple[str, str, str]] = []
+        # Whether each prompt was said to open a commission.
+        self.openings: list[bool] = []
+        # The number each text was sent under, in the order of ``sent``.
+        self.serials: list[int | None] = []
+        self.closed: list[str] = []
+
+    async def start(self, spec: Any) -> None:
+        self.specs.append(spec)
+
+    async def prompt(self, session_id: str, text: str, *, opening: bool = False, serial: int | None = None) -> None:
+        self.sent.append(("prompt", session_id, text))
+        self.openings.append(opening)
+        self.serials.append(serial)
+
+    async def steer(self, session_id: str, text: str, *, serial: int | None = None) -> None:
+        self.sent.append(("steer", session_id, text))
+        self.serials.append(serial)
+
+    async def close(self, session_id: str) -> None:
+        self.closed.append(session_id)
+        self.say(session_id, "ended", reason="closed")
+
+    async def shutdown(self) -> None:
+        return None
+
+    def say(self, session_id: str, kind: str, **fields: Any) -> None:
+        """Hand the host one session event, as a runtime does."""
+        self._on_event({"type": kind, "session_id": session_id, **fields})
+
+
+def _recording_host(hosts: list[Any], tmp_path: Path, **kwargs: Any) -> tuple[Any, list[RecordingRuntime]]:
+    runtimes: list[RecordingRuntime] = []
+
+    def factory(on_event: Any, callbacks: Any) -> RecordingRuntime:
+        runtimes.append(RecordingRuntime(on_event, callbacks))
+        return runtimes[-1]
+
+    kwargs.setdefault("task_agent_model", fake_model)
+    host = make_host(tmp_path, None, decision_llm=FakeDecisionLLM(), runtime_factory=factory, **kwargs)
+    hosts.append(host)
+    return host, runtimes
+
+
+async def _started(
+    host: Any, runtimes: list[RecordingRuntime], text: str = "tidy the desktop"
+) -> tuple[Any, RecordingRuntime]:
+    """File a commission and return it once its session has been given its work."""
+    commission = await _filed(host, text)
+    assert await host.task_agents.submit(commission)
+    runtime = runtimes[0]
+    # What the commission is, is the message that opens it in its session.
+    kind, session, said = runtime.sent[-1]
+    assert (kind, session, runtime.openings[-1]) == ("prompt", commission.id, True) and text in said
+    return commission, runtime
+
+
+async def test_a_start_that_fails_after_a_runtime_opened_its_session_closes_it_before_the_session_is_let_go(
+    hosts, tmp_path, monkeypatch
+):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    await host.space.touch_project("Budget app")
+    told = RecordingRuntime.prompt
+    order: list[str] = []
+
+    async def cannot_be_told(
+        self: Any, session_id: str, text: str, *, opening: bool = False, **_options: Any
+    ) -> None:
+        if not order:
+            order.append("refused")
+            raise RuntimeError("the runtime went away")
+        order.append("told")
+        await told(self, session_id, text, opening=opening)
+
+    closing = RecordingRuntime.close
+
+    async def close(self: Any, session_id: str) -> None:
+        order.append("closed")
+        await closing(self, session_id)
+
+    monkeypatch.setattr(RecordingRuntime, "prompt", cannot_be_told)
+    monkeypatch.setattr(RecordingRuntime, "close", close)
+    first = await _filed(host, "add a CSV export to the budget app")
+    await host.task_agents.submit(first)
+    failed = await wait_status(host, first.id, "failed")
+    assert "the runtime went away" in failed.status_reason
+    await host.task_agents.settle()
+    await wait_until(lambda: host.task_agents._held_by == {}, what="the session being let go")
+
+    # The runtime had opened the session before the start failed: it was closed there, and
+    # the next commission of the project is started in it only after that.
+    (runtime,) = runtimes
+    assert runtime.closed == [first.id]
+    second = await _filed(host, "add a chart to the budget app")
+    assert await host.task_agents.submit(second)
+    assert [spec.session_id for spec in runtime.specs] == [first.id, first.id]
+    assert order == ["refused", "closed", "told"]
+
+
+@pytest.mark.parametrize(
+    ("error", "told_again"),
+    [
+        # Said by the runtime of a run it carried out: what it was sent is in its transcript.
+        ("the model returned no response", False),
+        # Said by the host for a runtime process that went away: nothing tells how far it got.
+        ("the runtime process exited", True),
+    ],
+)
+async def test_what_a_commission_is_is_said_again_after_a_runtime_process_that_went_away(
+    hosts, tmp_path, error, told_again
+):
+    from nekoclaw.runtime.protocol import PROCESS_EXITED_ERROR
+
+    assert PROCESS_EXITED_ERROR == "the runtime process exited"
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission, runtime = await _started(host, runtimes)
+    # As a session directory with something said in it has.
+    session_dir = Path((await host.ledger.get(commission.id)).session_dir)
+    (session_dir / "transcript.jsonl").write_text("{}\n", encoding="utf-8")
+
+    runtime.say(commission.id, "ended", reason="error", error=error, inputs=1)
+    await wait_status(host, commission.id, "failed")
+    await host.task_agents.settle()
+    await wait_until(lambda: host.task_agents.running == [], what="the session being released")
+
+    assert await host.task_agents.tell(commission.id, "try once more")
+    await wait_until(lambda: len(runtime.sent) >= 2, what="the commission being taken up again")
+    kind, _session, said = runtime.sent[-1]
+    assert (kind, runtime.openings[-1]) == ("prompt", told_again)
+    assert said.startswith(f"Commission {commission.id}\n") is told_again
+    assert said.endswith("try once more")
+
+
+async def _once(commission_id: str, ask: Any) -> str:
+    return "once"
+
+
+async def _uses_the_browser(host: Any, commission_id: str) -> None:
+    """Leave a commission as its first browser step does: allowed "once", and occupying the browser."""
+    host.permissions.set_asker(_once)
+    assert (await host.permissions.check(commission_id, "browser")).allow
+    assert await asyncio.wait_for(host.leases.acquire("browser", commission_id), 5) is None
+    assert host.permissions.run_grants(commission_id) == {("browser", None)}
+
+
+async def _status(host: Any, commission_id: str) -> str:
+    await host.task_agents.settle()
+    return (await host.ledger.get(commission_id)).status
+
+
+@pytest.mark.parametrize(
+    ("ending", "status"),
+    [
+        ({"reason": "completed", "inputs": 1, "text": "tidied"}, "done"),
+        ({"reason": "aborted", "inputs": 1}, "cancelled"),
+        ({"reason": "error", "inputs": 1, "error": "the model cannot be reached"}, "failed"),
+    ],
+)
+async def test_a_run_that_ends_lets_go_of_the_browser_and_of_what_was_allowed_once(hosts, tmp_path, ending, status):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission, runtime = await _started(host, runtimes)
+    await _uses_the_browser(host, commission.id)
+
+    runtime.say(commission.id, "ended", **ending)
+
+    assert await _status(host, commission.id) == status
+    assert host.leases.occupied() == {}
+    assert host.permissions.run_grants(commission.id) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("event", "said", "detail", "reason"),
+    [
+        # Stopped on an error that names nothing.
+        ({"kind": "ended", "reason": "error", "inputs": 1}, "run", "", "the run failed"),
+        ({"kind": "ended", "reason": "error", "inputs": 1, "error": "the model cannot be reached"},
+         "run", "the model cannot be reached", "the model cannot be reached"),
+        # Its work was refused: none of it was taken, so it did not start.
+        ({"kind": "error", "command": "prompt", "message": "the session is busy"},
+         "start", "the session is busy", "the session is busy"),
+        # Refused without a word: the host's own fallback is for the record only.
+        ({"kind": "error", "command": "prompt"}, "start", "", "the runtime rejected the command"),
+    ],
+)
+async def test_how_a_run_failed_is_told_to_her_in_english_shown_in_her_language_and_kept_as_it_was(hosts, tmp_path, event, said, detail, reason):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission = await _filed(host, "tidy the desktop", lang="ja")
+    assert await host.task_agents.submit(commission)
+    runtime = runtimes[0]
+    assert runtime.sent[-1][:2] == ("prompt", commission.id)
+
+    event = dict(event)
+    runtime.say(commission.id, event.pop("kind"), **event)
+
+    failed = await wait_status(host, commission.id, "failed")
+    assert failed.status_reason == reason
+    told, shown = _failed(said, "ja", detail)
+    (report,) = await outbox(host, "task_result")
+    assert report.payload["summary"] == told == failed.result_summary
+    assert report.payload["text"] == shown
+    # Nothing of the English record reaches her when the error named nothing.
+    if not detail:
+        assert reason not in report.payload["summary"]
+
+
+async def test_work_refused_after_some_was_taken_is_said_to_have_stopped_partway(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission = await _filed(host, "tidy the desktop", lang="zh")
+    assert await host.task_agents.submit(commission)
+    # As when an answer went to it after its work: two texts sent, the second refused.
+    host.task_agents._sessions[commission.id].sent = 2
+
+    runtimes[0].say(commission.id, "error", command="prompt", message="the session is busy")
+
+    await wait_status(host, commission.id, "failed")
+    told, shown = _failed("run", "zh", "the session is busy")
+    (report,) = await outbox(host, "task_result")
+    assert (report.payload["summary"], report.payload["text"]) == (told, shown)
+
+
+@pytest.mark.parametrize(("refused", "said"), [("prompt", "start"), ("steer", "run")])
+async def test_a_start_that_fails_once_its_work_went_through_is_said_to_have_stopped_partway(
+    hosts, tmp_path, monkeypatch, refused, said
+):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission = await _filed(host, "tidy the desktop", lang="zh")
+    told, steered = RecordingRuntime.prompt, RecordingRuntime.steer
+
+    async def prompt(self: Any, session_id: str, text: str, *, opening: bool = False, serial: int | None = None) -> None:
+        if refused == "prompt":
+            raise RuntimeError("the runtime went away")
+        await told(self, session_id, text, opening=opening, serial=serial)
+        # Passed on while the work was on its way: sent after it.
+        host.task_agents._notes.setdefault(commission.id, []).append("the downloads too")
+
+    async def steer(self: Any, session_id: str, text: str, *, serial: int | None = None) -> None:
+        if refused == "steer":
+            raise RuntimeError("the runtime went away")
+        await steered(self, session_id, text, serial=serial)
+
+    monkeypatch.setattr(RecordingRuntime, "prompt", prompt)
+    monkeypatch.setattr(RecordingRuntime, "steer", steer)
+    await host.task_agents.submit(commission)
+
+    failed = await wait_status(host, commission.id, "failed")
+    assert failed.status_reason == "the task agent could not be started: the runtime went away"
+    assert [kind for kind, _session, _text in runtimes[0].sent] == (["prompt"] if refused == "steer" else [])
+    told, shown = _failed(said, "zh", "the runtime went away")
+    (report,) = await outbox(host, "task_result")
+    assert (report.payload["summary"], report.payload["text"]) == (told, shown)
+
+
+async def test_a_session_closed_under_a_commission_that_goes_on_ends_its_run_too(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission, runtime = await _started(host, runtimes)
+    await _uses_the_browser(host, commission.id)
+
+    # A runtime with nothing to do closes its idle sessions.
+    runtime.say(commission.id, "ended", reason="closed")
+
+    # The commission did not end, so nothing but the end of the run lets go.
+    assert await _status(host, commission.id) == "working"
+    assert host.leases.occupied() == {}
+    assert host.permissions.run_grants(commission.id) == frozenset()
+
+
+async def test_a_lead_whose_run_ended_while_its_task_agent_works_leaves_the_browser_to_it(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    lead, runtime = await _started(host, runtimes)
+    child, _created = await host.ledger.create(
+        lanlan_name="Lan",
+        title="look up trains",
+        dispatch_text="look up trains",
+        source="task_agent",
+        route="task_agent",
+        parent_id=lead.id,
+        name="agent-1",
+    )
+    await host.ledger.transition(child.id, "working")
+    await _uses_the_browser(host, lead.id)
+    await _uses_the_browser(host, child.id)
+
+    runtime.say(lead.id, "ended", reason="completed", inputs=1, text="waiting for the trains")
+
+    # Not done: its task agent's result starts its next run. Its own hold on
+    # the browser and its own approval end with its run; the task agent's stay.
+    assert await _status(host, lead.id) == "working"
+    held = host.leases.holder("browser")
+    assert (held.team, held.members) == (lead.id, {child.id})
+    assert host.permissions.run_grants(lead.id) == frozenset()
+    assert host.permissions.run_grants(child.id) == {("browser", None)}
+
+
+async def test_the_end_of_a_run_that_another_run_follows_lets_go_of_nothing(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission, runtime = await _started(host, runtimes)
+    await _uses_the_browser(host, commission.id)
+    # Said to it once its run had taken its work: that starts another run,
+    # which may be at work in the browser by the time the first one's end is handled.
+    assert await host.task_agents.tell(commission.id, "also dust the shelf")
+    assert [command for command, _session, _text in runtime.sent] == ["prompt", "steer"]
+
+    runtime.say(commission.id, "ended", reason="completed", inputs=1, text="tidied")
+
+    assert await _status(host, commission.id) == "working"
+    assert host.leases.occupied() == {"browser": commission.id}
+    assert host.permissions.run_grants(commission.id) == {("browser", None)}
+
+    # The run that took both texts is the one whose end lets go.
+    runtime.say(commission.id, "ended", reason="completed", inputs=2, text="tidied and dusted")
+
+    assert await _status(host, commission.id) == "done"
+    assert host.leases.occupied() == {}
+    assert host.permissions.run_grants(commission.id) == frozenset()
+
+
+async def test_a_run_that_ended_with_a_question_has_to_be_allowed_again_in_the_next(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission, runtime = await _started(host, runtimes)
+    await _uses_the_browser(host, commission.id)
+
+    runtime.say(commission.id, "report", status="waiting", summary="Which shelf?")
+    # The user gets the browser back to answer with.
+    assert await _status(host, commission.id) == "waiting_user"
+    assert host.leases.occupied() == {}
+    runtime.say(commission.id, "ended", reason="completed", inputs=1, text="")
+
+    assert await _status(host, commission.id) == "waiting_user"
+    assert host.permissions.run_grants(commission.id) == frozenset()
+
+
+async def test_a_task_agent_model_is_taken_to_see_pictures_unless_it_is_known_not_to(hosts, tmp_path):
+    current = {"model": "vision-9", "base_url": "http://127.0.0.1:9/v1", "api_key": "test-key"}
+
+    async def model() -> dict[str, Any]:
+        return dict(current)
+
+    host, runtimes = _recording_host(hosts, tmp_path, task_agent_model=model)
+    await host.model_capabilities.note_images_refused("http://127.0.0.1:9/v1", "text-only")
+
+    _first, runtime = await _started(host, runtimes)
+    # The other model, its address written with a slash at the end this time.
+    current.update(model="text-only", base_url="http://127.0.0.1:9/v1/")
+    await _started(host, runtimes, "water the plants")
+
+    assert [(spec.model.model, spec.model.supports_images) for spec in runtime.specs] == [
+        ("vision-9", True),
+        ("text-only", False),
+    ]
+
+
+@pytest.mark.parametrize(("says", "refusal_noted"), [(False, False), (True, True)])
+async def test_what_the_model_configuration_says_about_pictures_is_taken_as_it_is(
+    hosts, tmp_path, says, refusal_noted
+):
+    async def model() -> dict[str, Any]:
+        return {"model": "fake-model", "api_key": "test-key", "supports_images": says}
+
+    host, runtimes = _recording_host(hosts, tmp_path, task_agent_model=model)
+    if refusal_noted:
+        await host.model_capabilities.note_images_refused(None, "fake-model")
+
+    _commission, runtime = await _started(host, runtimes)
+
+    # No, though nothing is known against the model; yes, though a refusal was noted.
+    assert runtime.specs[0].model.supports_images is says
+
+
+async def test_not_being_able_to_look_the_model_up_counts_as_seeing_pictures(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+
+    async def broken(base_url: Any, model: Any) -> bool:
+        raise OSError("the disk is gone")
+
+    host.model_capabilities.sees_images = broken
+
+    commission, runtime = await _started(host, runtimes)
+
+    assert runtime.specs[0].model.supports_images is True
+    assert await _status(host, commission.id) == "working"
+
+
+async def test_with_nothing_to_serve_a_task_agent_gets_the_gateway_all_the_same_and_no_rule_for_screenshots(
+    hosts, tmp_path
+):
+    host, runtimes = _recording_host(hosts, tmp_path)
+
+    commission, runtime = await _started(host, runtimes)
+
+    (spec,) = runtime.specs
+    # Its session keeps the tools it is opened with: what is installed or switched on while
+    # the session lasts is reached through the gateway's two.
+    assert host.gateway.started and spec.gateway is not None
+    assert spec.gateway.url == host.gateway.url
+    assert host.gateway._by_commission[commission.id].token == spec.gateway.token
+    assert (spec.image_retention, spec.image_pools) == ({}, {})
+
+
+class _ScreenTools:
+    """Built-in tools: two that hand screenshots back, one that does not, and one that is switched off."""
+
+    def available(self) -> list[Any]:
+        from nekoclaw.host.capabilities import builtin_tool
+
+        def tool(group: str, name: str, **kwargs: Any) -> Any:
+            return builtin_tool(group, {"name": name, "description": f"The {name} tool."}, **kwargs)
+
+        return [
+            tool("keyboard_mouse", "computer", needs_images=True),
+            tool("browser", "browser_take_snapshot"),
+            tool("browser", "browser_take_screenshot", needs_images=True),
+            tool("browser", "browser_record", needs_images=True, available=False, unavailable_reason="switched off"),
+        ]
+
+    async def run(self, capability: Any, *, commission_id: str, arguments: dict[str, Any]) -> Any:
+        raise AssertionError("no tool is called in these tests")
+
+    async def released(self, group: str, commission_id: str) -> None:
+        return None
+
+
+@pytest.mark.parametrize("sees_pictures", [True, False])
+async def test_the_spec_and_the_gateway_token_agree_on_pictures_and_screenshots_are_kept_by_group(
+    hosts, tmp_path, monkeypatch, sees_pictures
+):
+    import config.nekoclaw_settings as settings
+
+    monkeypatch.setattr(settings, "TASK_AGENT_SCREENSHOTS_KEPT", 5)
+    host, runtimes = _recording_host(hosts, tmp_path, builtins=_ScreenTools())
+
+    async def no_listener() -> str:
+        # No session is opened in this test, so nothing has to listen.
+        return "http://127.0.0.1:1/mcp"
+
+    host.gateway.start = no_listener
+    if not sees_pictures:
+        await host.model_capabilities.note_images_refused(None, "fake-model")
+
+    commission, runtime = await _started(host, runtimes)
+
+    (spec,) = runtime.specs
+    grant = host.gateway._by_commission[commission.id]
+    assert spec.model.supports_images is sees_pictures
+    assert grant.supports_images is sees_pictures
+    assert (spec.gateway.url, spec.gateway.token) == ("http://127.0.0.1:1/mcp", grant.token)
+    # Every tool that hands screenshots back is kept that many of; a tool
+    # without pictures has no rule. One that is switched off right now has
+    # the rule all the same: switched on while the task agent works, it is
+    # reached through the gateway's call tool, whose results have the rule
+    # too. All of them are counted together: that many screenshots stay in
+    # the context, whichever tools they came from.
+    assert spec.image_retention == {
+        "computer": 5,
+        "browser_take_screenshot": 5,
+        "browser_record": 5,
+        "capability_call": 5,
+    }
+    assert set(spec.image_pools) == set(spec.image_retention) and len(set(spec.image_pools.values())) == 1
+
+
+async def test_screenshots_are_limited_for_a_task_agent_that_started_before_any_picture_tool_could_be_called(
+    hosts, tmp_path
+):
+    class NothingReadyYet(_ScreenTools):
+        """The application has just started: the switches are still being checked."""
+
+        def available(self) -> list[Any]:
+            from dataclasses import replace
+
+            return [replace(item, available=False, unavailable_reason="not checked yet") for item in super().available()]
+
+    host, runtimes = _recording_host(hosts, tmp_path, builtins=NothingReadyYet())
+    _commission, runtime = await _started(host, runtimes)
+
+    (spec,) = runtime.specs
+    # Nothing could be called, so the task agent got no gateway at all; yet
+    # what it may be handed later (through the call tool, once a switch is
+    # on) is limited from the start.
+    assert spec.image_retention["capability_call"] == spec.image_retention["computer"] > 0
+
+
+def test_screenshots_fetched_through_the_call_tool_do_not_pile_up_in_the_context():
+    from nekoclaw.host.gateway import CALL_TOOL
+    from nekoclaw.host.task_agents import TaskAgentManager
+    from nekoclaw.runtime.context import Row, retain_recent_images
+    from nekoclaw.runtime.loop.messages import ImageContent, TextContent, ToolResultMessage
+
+    screen = SimpleNamespace(tool_name="computer", needs_images=True, group="keyboard_mouse")
+    plain = SimpleNamespace(tool_name="weather", needs_images=False, group=None)
+    page = SimpleNamespace(tool_name="browser_take_screenshot", needs_images=True, group="browser")
+    retention, pools = TaskAgentManager._image_retention([screen, page, plain])
+    kept_at_most = retention[CALL_TOOL]
+    assert retention == {"computer": kept_at_most, "browser_take_screenshot": kept_at_most, CALL_TOOL: kept_at_most}
+
+    def shot(tool: str, number: int) -> Row:
+        message = ToolResultMessage(
+            tool_call_id=f"call-{number}",
+            tool_name=tool,
+            content=[TextContent(text=f"shot {number}"), ImageContent(data="aGk=", mime_type="image/jpeg")],
+        )
+        return Row(f"entry-{number}", "message", message)
+
+    # Screenshots of the desktop, of a page, and some taken through the call
+    # tool instead of calling the tools by their names: the newest stay,
+    # that many in all. (What one may weigh is set for that many.)
+    names = [CALL_TOOL, "computer", "browser_take_screenshot"]
+    rows = [shot(names[number % 3], number) for number in range(kept_at_most * 3 + 1)]
+    kept = retain_recent_images(rows, retention, pools)
+    assert kept is not None
+    with_picture = [row.entry_id for row in kept if any(isinstance(block, ImageContent) for block in row.message.content)]
+    assert with_picture == [f"entry-{number}" for number in range(kept_at_most * 2 + 1, kept_at_most * 3 + 1)]
+
+    # With no tool that hands pictures back there is nothing to limit.
+    assert TaskAgentManager._image_retention([plain]) == ({}, {})
+
+
+def test_three_screenshots_of_a_group_stay_in_a_task_agents_context():
+    from config.nekoclaw_settings import TASK_AGENT_SCREENSHOTS_KEPT
+
+    assert TASK_AGENT_SCREENSHOTS_KEPT == 3
+
+
+async def test_a_model_found_to_take_no_pictures_is_remembered_for_the_task_agents_started_later(hosts, tmp_path):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    first, runtime = await _started(host, runtimes)
+
+    runtime.say(first.id, "model_capability", supports_images=False)
+    await host.task_agents.settle()
+
+    assert await host.model_capabilities.sees_images(None, "fake-model") is False
+    assert [event.payload for event in await _events(host, first.id, "model_capability")] == [
+        {"supports_images": False}
+    ]
+    await _started(host, runtimes, "water the plants")
+    assert [spec.model.supports_images for spec in runtime.specs] == [True, False]
+
+
+async def test_a_model_found_to_take_no_pictures_loses_the_picture_tools_in_the_session_that_found_it_out(
+    hosts, tmp_path
+):
+    host, runtimes = _recording_host(hosts, tmp_path, builtins=_ScreenTools())
+
+    async def no_listener() -> str:
+        return "http://127.0.0.1:1/mcp"
+
+    host.gateway.start = no_listener
+    commission, runtime = await _started(host, runtimes)
+    grant = host.gateway._by_commission[commission.id]
+    assert grant.supports_images is True
+    loaded = await host.gateway.call_tool(grant, "capability_search", {"group": "desktop"})
+    assert loaded["isError"] is False and '"name": "computer"' in loaded["content"][0]["text"]
+
+    runtime.say(
+        commission.id, "model_capability", supports_images=False, reason="This model does not support image input."
+    )
+    await host.task_agents.settle()
+
+    # Its screenshots no longer reach the model: it would go on clicking a screen it cannot see.
+    # Having loaded the group does not keep the tool for it, and the group cannot be loaded again.
+    assert grant.supports_images is False
+    again = await host.gateway.call_tool(grant, "capability_search", {"group": "desktop"})
+    assert again["isError"] is True
+    assert again["content"][0]["text"].startswith("The desktop tools work from pictures")
+    refused = await host.gateway.call_tool(grant, "computer", {"action": "click", "x": 1, "y": 1})
+    assert refused["isError"] is True
+    assert refused["content"][0]["text"].startswith("computer works from pictures, and the model in use does not take pictures")
+    # A commission that is not under way has no token to change.
+    host.gateway.images_refused("no-such-commission")
+    # What the provider said is kept with what is remembered.
+    told = await host.model_capabilities.describe(None, "fake-model")
+    assert (told["sees"], told["source"], told["reason"]) == (False, "refused", "This model does not support image input.")
+
+
+async def test_pictures_refused_for_what_they_were_end_the_pictures_of_the_session_and_nothing_is_remembered(
+    hosts, tmp_path
+):
+    host, runtimes = _recording_host(hosts, tmp_path, builtins=_ScreenTools())
+
+    async def no_listener() -> str:
+        return "http://127.0.0.1:1/mcp"
+
+    host.gateway.start = no_listener
+    commission, runtime = await _started(host, runtimes)
+    grant = host.gateway._by_commission[commission.id]
+
+    runtime.say(
+        commission.id,
+        "model_capability",
+        supports_images=False,
+        reason="The image format image/bmp is not supported",
+        lasting=False,
+    )
+    await host.task_agents.settle()
+
+    # This session goes without pictures, so it loses the tools that work from them.
+    assert grant.supports_images is False
+    # The model is not written down: a format, a size, a number of pictures says nothing about it.
+    assert await host.model_capabilities.sees_images(None, "fake-model") is True
+    assert not (tmp_path / "nekoclaw" / "model_capabilities.json").exists()
+
+
+async def test_what_is_remembered_is_the_model_the_session_was_started_with(hosts, tmp_path):
+    current = {"model": "vision-9", "base_url": "http://127.0.0.1:9/v1/", "api_key": "test-key"}
+
+    async def model() -> dict[str, Any]:
+        return dict(current)
+
+    host, runtimes = _recording_host(hosts, tmp_path, task_agent_model=model)
+    commission, runtime = await _started(host, runtimes)
+    # The user switches to another model while the task agent works.
+    current.update(model="other-model", base_url="http://127.0.0.1:10/v1")
+
+    runtime.say(commission.id, "model_capability", supports_images=False)
+    await host.task_agents.settle()
+
+    assert await host.model_capabilities.sees_images("http://127.0.0.1:9/v1", "vision-9") is False
+    assert await host.model_capabilities.sees_images("http://127.0.0.1:10/v1", "other-model") is True
+    saved = json.loads((tmp_path / "nekoclaw" / "model_capabilities.json").read_text(encoding="utf-8"))
+    assert list(saved["models"]) == ["http://127.0.0.1:9/v1|vision-9"]
+
+
+@pytest.mark.parametrize("fields", [{"supports_images": True}, {}])
+async def test_an_event_that_does_not_say_pictures_were_refused_is_not_remembered(hosts, tmp_path, fields):
+    host, runtimes = _recording_host(hosts, tmp_path)
+    commission, runtime = await _started(host, runtimes)
+
+    runtime.say(commission.id, "model_capability", **fields)
+    await host.task_agents.settle()
+
+    assert await host.model_capabilities.sees_images(None, "fake-model") is True
+    assert not (tmp_path / "nekoclaw" / "model_capabilities.json").exists()
+
+
+async def test_a_refused_picture_is_learned_from_and_the_next_task_agent_gets_no_picture_tool(hosts, tmp_path):
+    from PIL import Image
+
+    workdir = tmp_path / "desk"
+    workdir.mkdir()
+    Image.new("RGB", (4, 4), (200, 30, 30)).save(workdir / "shot.png", format="PNG")
+    first = ScriptedLLM(
+        [
+            [call("read_image", {"file_path": "shot.png"}), finish("tool_calls")],
+            # The request that carries the picture is refused for it, and sent again without.
+            [RuntimeError("Invalid content type. image_url is only supported by certain models.")],
+            [call("report", {"status": "ready", "summary": "a red square"}, "c2"), finish("tool_calls")],
+        ]
+    )
+    second = ScriptedLLM([_report("ready", "nothing to look at")])
+    models = iter([first, second])
+    specs: list[Any] = []
+
+    def pick(spec: Any) -> ScriptedLLM:
+        specs.append(spec)
+        return next(models)
+
+    host = _host(hosts, tmp_path, pick)
+
+    one = await _filed(host, "look at shot.png", workdir=str(workdir))
+    await host.task_agents.submit(one)
+    done = await wait_status(host, one.id, "done")
+
+    assert done.result_summary == "a red square"
+    assert len(first.requests) == 3
+    learned = await _events(host, one.id, "model_capability")
+    assert [event.payload["supports_images"] for event in learned] == [False]
+    assert await host.model_capabilities.sees_images(None, "fake-model") is False
+
+    two = await _filed(host, "look at it again", workdir=str(workdir))
+    await host.task_agents.submit(two)
+    await wait_status(host, two.id, "done")
+
+    def offered(llm: ScriptedLLM) -> set[str]:
+        return {tool["function"]["name"] for tool in llm.overrides[0]["tools"]}
+
+    assert [spec.model.supports_images for spec in specs] == [True, False]
+    assert "read_image" in offered(first) and "read_image" not in offered(second)
+
+
+# ---------------------------------------------------------------------------
+# Where a commission's session is kept
+# ---------------------------------------------------------------------------
+
+
+def _sessions(root: Path) -> Path:
+    return root / "nekoclaw" / "task_agents" / "projects" / "_daily" / "sessions"
+
+
+async def test_where_the_session_is_kept_is_recorded_when_the_commission_is_taken_up(hosts, tmp_path):
+    host = _host(hosts, tmp_path, ScriptedLLM([_report("ready", "done")]))
+
+    receipt = await _dispatch(host, "tidy the desktop")
+    done = await wait_status(host, receipt.commission_id, "done")
+
+    assert Path(done.session_dir) == _sessions(tmp_path) / receipt.commission_id
+    assert Path(done.workdir) == Path(done.session_dir) / "work"
+
+
+async def test_a_commission_taken_up_before_the_data_root_moved_goes_on_in_the_session_it_had(hosts, tmp_path):
+    import shutil
+
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    old = _host(hosts, old_root, ScriptedLLM([_report("blocked", "the camera drive is not connected")]))
+    receipt = await _dispatch(old, "sort the photos on the camera drive")
+    await wait_status(old, receipt.commission_id, "blocked")
+    await wait_until(lambda: old.task_agents.running == [], what="the session being released")
+    hosts.remove(old)
+    await old.shutdown()
+
+    # The storage location is moved: the ledger goes along, the sessions stay where they are.
+    (new_root / "nekoclaw").mkdir(parents=True)
+    for name in ("ledger.db", "ledger.db-wal"):
+        if (old_root / "nekoclaw" / name).exists():
+            shutil.copy2(old_root / "nekoclaw" / name, new_root / "nekoclaw" / name)
+    resumed = ScriptedLLM([_report("ready", "sorted after all")])
+    new = _host(hosts, new_root, resumed)
+
+    assert await new.task_agents.tell(receipt.commission_id, "the camera drive is E: now") is True
+    done = await wait_status(new, receipt.commission_id, "done")
+
+    assert done.result_summary == "sorted after all"
+    # It went on where it was: the model was shown what had been said before the move ...
+    assert any(message.get("role") == "assistant" for message in resumed.requests[0])
+    started = await _events(new, receipt.commission_id, "started")
+    assert [event.payload["resumed"] for event in started] == [False, True]
+    # ... in the session it had, not in an empty one below the new root.
+    assert Path(done.session_dir) == _sessions(old_root) / receipt.commission_id
+    assert not (new_root / "nekoclaw" / "task_agents").exists()
+
+
+async def test_a_commission_taken_up_before_the_place_was_recorded_is_found_by_its_working_directory(hosts, tmp_path):
+    host = _host(hosts, tmp_path, ScriptedLLM([_report("ready", "done")]))
+    elsewhere = tmp_path / "moved-from" / "sessions"
+    commission, _created = await host.ledger.create(
+        lanlan_name="Lan", title="sort", dispatch_text="sort the photos", source="dispatch", route="task_agent"
+    )
+    # As an earlier build left it: the working directory on record, the session directory not.
+    await host.ledger.update(commission.id, workdir=str(elsewhere / commission.id / "work"))
+    kept = await host.ledger.get(commission.id)
+    assert kept.session_dir is None
+    assert host.task_agents._session_dir_of(kept) == elsewhere / commission.id
+
+    # A working directory that is not the default one of its own session says nothing of it.
+    await host.ledger.update(commission.id, workdir=str(elsewhere / "another-commission" / "work"))
+    assert host.task_agents._session_dir_of(await host.ledger.get(commission.id)) == _sessions(tmp_path) / commission.id
+    await host.ledger.update(commission.id, workdir=str(tmp_path / "a project of the user"))
+    assert host.task_agents._session_dir_of(await host.ledger.get(commission.id)) == _sessions(tmp_path) / commission.id
+    # And one that is on record is taken at its word.
+    await host.ledger.update(commission.id, session_dir=str(tmp_path / "recorded"))
+    assert host.task_agents._session_dir_of(await host.ledger.get(commission.id)) == tmp_path / "recorded"
+
+
+async def test_a_data_folder_moved_by_hand_takes_its_sessions_along(hosts, tmp_path):
+    import shutil
+
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    old = _host(hosts, old_root, ScriptedLLM([_report("blocked", "the camera drive is not connected")]))
+    receipt = await _dispatch(old, "sort the photos on the camera drive")
+    await wait_status(old, receipt.commission_id, "blocked")
+    await wait_until(lambda: old.task_agents.running == [], what="the session being released")
+    hosts.remove(old)
+    await old.shutdown()
+    # What the task agent had got done so far, in its working directory.
+    (_sessions(old_root) / receipt.commission_id / "work" / "sorted so far.txt").write_text("IMG_0001", encoding="utf-8")
+
+    # Not through the storage settings: the user moves the whole folder and points the application at it.
+    shutil.move(str(old_root), str(new_root))
+    resumed = ScriptedLLM([_report("ready", "sorted after all")])
+    new = _host(hosts, new_root, resumed)
+
+    assert await new.task_agents.tell(receipt.commission_id, "the camera drive is E: now") is True
+    done = await wait_status(new, receipt.commission_id, "done")
+
+    assert done.result_summary == "sorted after all"
+    # The sessions came along. The place on record is where they used to be: taken at its word, it would
+    # have been made anew, empty, and the commission begun from nothing.
+    assert any(message.get("role") == "assistant" for message in resumed.requests[0])
+    started = await _events(new, receipt.commission_id, "started")
+    assert [event.payload["resumed"] for event in started] == [False, True]
+    # Where it is kept now is what is on record from here on.
+    assert Path(done.session_dir) == _sessions(new_root) / receipt.commission_id
+    # Its working directory went along with it: the task agent works on among what it had got done, not in
+    # an empty directory made anew where the folder used to be.
+    assert Path(done.workdir) == _sessions(new_root) / receipt.commission_id / "work"
+    assert (Path(done.workdir) / "sorted so far.txt").read_text(encoding="utf-8") == "IMG_0001"
+    assert not old_root.exists()
+
+
+async def test_a_working_directory_goes_where_its_sessions_went_and_one_elsewhere_stays(hosts, tmp_path):
+    host = _host(hosts, tmp_path, ScriptedLLM([_report("ready", "done")]))
+    commission, _created = await host.ledger.create(
+        lanlan_name="Lan", title="sort", dispatch_text="sort the photos", source="dispatch", route="task_agent"
+    )
+    were = tmp_path / "where they were" / "sessions"
+    recorded, current = were / commission.id, _sessions(tmp_path) / commission.id
+
+    async def workdir(recorded_workdir: Path | None, kept_in: Path) -> Path:
+        await host.ledger.update(
+            commission.id, session_dir=str(recorded), workdir=str(recorded_workdir) if recorded_workdir else None
+        )
+        return host.task_agents._workdir_of(await host.ledger.get(commission.id), kept_in)
+
+    # The session is where the ledger has it: so is the working directory, whichever it is.
+    assert await workdir(recorded / "work", recorded) == recorded / "work"
+    assert await workdir(tmp_path / "a project of the user", recorded) == tmp_path / "a project of the user"
+    # The sessions are below the root of now. The ``work`` directory of its own session went along ...
+    assert await workdir(recorded / "work", current) == current / "work"
+    # ... and so did a directory inside the session of the commission that started this one ...
+    assert await workdir(were / "its-parent" / "work" / "thumbnails", current) == (
+        _sessions(tmp_path) / "its-parent" / "work" / "thumbnails"
+    )
+    # ... while a project of the user's is where it always was, and so is anything else outside the sessions.
+    assert await workdir(tmp_path / "a project of the user", current) == tmp_path / "a project of the user"
+    assert await workdir(were.parent / "beside the sessions", current) == were.parent / "beside the sessions"
+    # None on record: the default one below the root of now.
+    assert await workdir(None, current) == current / "work"
+
+    # A commission from before the place of its session was recorded is told by its working directory.
+    await host.ledger.update(commission.id, session_dir=None, workdir=str(recorded / "work"))
+    older = await host.ledger.get(commission.id)
+    assert host.task_agents._workdir_of(older, current) == current / "work"
+    assert host.task_agents._workdir_of(older, recorded) == recorded / "work"
+
+
+async def test_the_place_on_record_gives_way_only_to_a_session_that_has_something_in_it(hosts, tmp_path):
+    host = _host(hosts, tmp_path, ScriptedLLM([_report("ready", "done")]))
+    commission, _created = await host.ledger.create(
+        lanlan_name="Lan", title="sort", dispatch_text="sort the photos", source="dispatch", route="task_agent"
+    )
+    recorded, current = tmp_path / "where it was" / commission.id, _sessions(tmp_path) / commission.id
+    await host.ledger.update(commission.id, session_dir=str(recorded))
+    kept = await host.ledger.get(commission.id)
+
+    def where() -> Path:
+        return host.task_agents._session_dir_of(kept)
+
+    # Nothing was said in either place: the one on record (the storage location was moved before the
+    # commission got as far as a first word, or the place is simply new).
+    assert where() == recorded
+    current.mkdir(parents=True)
+    assert where() == recorded
+    # A record with nothing in it is not one.
+    (current / "transcript.jsonl").write_bytes(b"")
+    assert where() == recorded
+    # Something was said below the root of now and nothing where the record points: the folder was moved.
+    (current / "transcript.jsonl").write_text('{"type": "session"}\n', encoding="utf-8")
+    assert where() == current
+    recorded.mkdir(parents=True)
+    (recorded / "transcript.jsonl").write_bytes(b"")
+    assert where() == current
+    # Something was said in both: the one on record, as the ledger was told.
+    (recorded / "transcript.jsonl").write_text('{"type": "session"}\n', encoding="utf-8")
+    assert where() == recorded
+
+    # The same for a commission from before the place was recorded, found by its working directory.
+    await host.ledger.update(commission.id, session_dir=None, workdir=str(recorded / "work"))
+    older = await host.ledger.get(commission.id)
+    assert older.session_dir is None and host.task_agents._session_dir_of(older) == recorded
+    (recorded / "transcript.jsonl").unlink()
+    assert host.task_agents._session_dir_of(older) == current
+
+
+async def test_a_session_whose_transcript_was_cleaned_is_found_where_its_files_are(hosts, tmp_path):
+    import shutil
+
+    host = _host(hosts, tmp_path, ScriptedLLM([_report("ready", "done")]))
+    commission, _created = await host.ledger.create(
+        lanlan_name="Lan", title="sort", dispatch_text="sort the photos", source="dispatch", route="task_agent"
+    )
+    # The data folder was moved by hand: the session came along, and the place on record is gone.
+    recorded, current = tmp_path / "where it was" / commission.id, _sessions(tmp_path) / commission.id
+    await host.ledger.update(commission.id, session_dir=str(recorded), workdir=str(recorded / "work"))
+    kept = await host.ledger.get(commission.id)
+    (current / "work").mkdir(parents=True)
+    (current / "work" / "result.txt").write_text("the user's file", encoding="utf-8")
+    (current / "transcript.jsonl").write_text('{"type": "session"}\n', encoding="utf-8")
+    assert host.task_agents._session_dir_of(kept) == current
+
+    # Old by now: what was said in it is removed, as the keeper of the space does.
+    (current / "transcript.jsonl").unlink()
+
+    # Taken up again, it goes on where its files are, not in a new, empty directory at the old place.
+    assert host.task_agents._session_dir_of(kept) == current
+    assert host.task_agents._workdir_of(kept, current) == current / "work"
+    # With nothing left but an empty directory there is nothing to tell by: the place on record.
+    shutil.rmtree(current / "work")
+    assert host.task_agents._session_dir_of(kept) == recorded
+    # And a place on record that is there is the place, whatever is below the root of now.
+    (current / "work").mkdir()
+    recorded.mkdir(parents=True)
+    assert host.task_agents._session_dir_of(kept) == recorded
+
+
+def test_the_host_and_the_runtime_call_the_transcript_by_the_same_name():
+    from nekoclaw.host.paths import TRANSCRIPT_NAME
+    from nekoclaw.runtime.session import TRANSCRIPT_FILE
+
+    assert TRANSCRIPT_NAME == TRANSCRIPT_FILE

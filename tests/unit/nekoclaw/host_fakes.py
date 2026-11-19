@@ -33,13 +33,24 @@ class FakeDecisionLLM:
         *,
         coarse: list[str] | None = None,
         fine: list[Any] | None = None,
+        turn: list[Any] | None = None,
     ) -> None:
         self.coarse = list(coarse or [])
+        # Answers of the turn check, like ``fine``: dicts, strings or exceptions.
+        self.turn = list(turn or [{"verdict": "none", "task": ""}])
         # Each item is a dict (dumped as JSON), a string (sent as is) or an
         # exception (raised). The last one repeats.
         self.fine = list(fine or [{"route": "task_agent"}])
         self.calls: list[tuple[str, list[dict[str, Any]]]] = []
         self.gate: asyncio.Event | None = None
+        # Answers for short descriptions (strings or exceptions), in order.
+        self.short: list[Any] = []
+        self.short_calls: list[list[dict[str, Any]]] = []
+        # Answers of the task agent space's own calls (the review of a
+        # finished commission, the summary of an archived project): dicts,
+        # strings or exceptions, in order; the last one repeats.
+        self.space: dict[str, list[Any]] = {"review": [], "archive": []}
+        self.space_calls: list[tuple[str, list[dict[str, Any]]]] = []
 
     def count(self, tier: str | None = None) -> int:
         return sum(1 for called, _ in self.calls if tier is None or called == tier)
@@ -51,13 +62,34 @@ class FakeDecisionLLM:
         return next(messages for called, messages in reversed(self.calls) if called == tier)
 
     async def complete(self, tier: str, messages: list[dict[str, Any]]) -> str:
+        if tier == "short_description":
+            # Written in the background whenever a plugin without one is
+            # listed; kept apart so it does not change what the other tests
+            # count. Answers nothing usable unless a test sets ``short``.
+            self.short_calls.append([dict(message) for message in messages])
+            answer = self.short.pop(0) if self.short else ""
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        if tier in self.space:
+            # Made in the background after a commission ended; kept apart
+            # like the short descriptions. Answers nothing usable unless a
+            # test sets ``space``.
+            self.space_calls.append((tier, [dict(message) for message in messages]))
+            answers = self.space[tier]
+            made = sum(1 for called, _ in self.space_calls if called == tier)
+            answer = answers[min(made - 1, len(answers) - 1)] if answers else ""
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
         self.calls.append((tier, [dict(message) for message in messages]))
         if self.gate is not None:
             await self.gate.wait()
         if tier == "coarse":
             return json.dumps(self.coarse)
-        index = min(self.count("fine") - 1, len(self.fine) - 1)
-        answer = self.fine[index]
+        answers = self.turn if tier == "turn_check" else self.fine
+        index = min(self.count(tier) - 1, len(answers) - 1)
+        answer = answers[index]
         if isinstance(answer, BaseException):
             raise answer
         return answer if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
@@ -74,6 +106,59 @@ async def fake_model() -> dict[str, Any]:
 
 async def no_model() -> None:
     return None
+
+
+class _ScriptOfTheCommission:
+    """A session's model that answers from the script of the commission the session is at work on."""
+
+    def __init__(self, scripts: dict[str, ScriptedLLM], seen: list[str] | None) -> None:
+        self._scripts = scripts
+        self._seen = seen
+        self._current: str | None = None
+
+    def _key(self, messages: list[dict[str, Any]]) -> str:
+        # The last message that names a commission decides: what a commission
+        # is stands in the message that opens it, which stays in the conversation.
+        for message in reversed(messages):
+            if message.get("role") == "system":
+                continue
+            text = json.dumps(message.get("content"), ensure_ascii=False)
+            found = [key for key in self._scripts if key in text]
+            if found:
+                # The one named first: a commission's opening message begins with
+                # what was dispatched, and may go on to name the one it follows up.
+                return min(found, key=text.index)
+        raise AssertionError(f"no script for a session asked: {messages[-1].get('content')!r}")
+
+    async def astream(self, messages: list[dict[str, Any]], **overrides: Any):  # noqa: ANN201
+        key = self._key(messages)
+        if key != self._current:
+            self._current = key
+            if self._seen is not None:
+                self._seen.append(key)
+        async for chunk in self._scripts[key].astream(messages, **overrides):
+            yield chunk
+
+    async def aclose(self) -> None:
+        return None
+
+
+def scripts_by_commission(scripts: dict[str, ScriptedLLM], seen: list[str] | None = None) -> Callable[[Any], Any]:
+    """Return a ``pick`` for ``scripted_runtime``: every session answers from the script of its commission.
+
+    ``scripts`` maps a text that occurs in what was dispatched to the model
+    that commission talks to. A session's spec says nothing of a commission
+    (its system prompt is the same whichever commission is worked on in
+    it), so the script is chosen when a request arrives, by the commission
+    the request is about. ``seen`` collects the keys in the order the
+    commissions were first asked about.
+    """
+
+    def pick(spec: Any) -> Any:
+        del spec
+        return _ScriptOfTheCommission(scripts, seen)
+
+    return pick
 
 
 def scripted_runtime(pick: Callable[[Any], ScriptedLLM]) -> Callable[[Any, Any], Any]:

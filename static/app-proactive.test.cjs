@@ -17,7 +17,7 @@ test('tutorial suppression rejects late vision acquisition at every async bounda
         let stopped = 0;
         let promptCalls = 0;
         const stream = { getTracks() { return [{ stop() { stopped += 1; } }]; } };
-        const state = { isRecording: true, proactiveVisionEnabled: true };
+        const state = { isRecording: true, proactiveVisionEnabled: true, proactiveChatEnabled: true, proactiveVisionChatEnabled: true };
         const window = {
             appState: state, appConst: {},
             addEventListener(type, listener) { listeners.set(type, listener); },
@@ -331,7 +331,8 @@ test('overlapping tutorial sources keep vision stopped until the final release',
     const listeners = new Map();
     let intervalCount = 0;
     const window = {
-        appState: { isRecording: true, proactiveVisionEnabled: true, proactiveChatEnabled: false },
+        // The voice-call heartbeat needs Proactive Chat and its Screen Share option on.
+        appState: { isRecording: true, proactiveVisionEnabled: true, proactiveChatEnabled: true, proactiveVisionChatEnabled: true },
         appConst: {},
         addEventListener(type, listener) { listeners.set(type, listener); }
     };
@@ -342,6 +343,7 @@ test('overlapping tutorial sources keep vision stopped until the final release',
         console,
         setInterval() { intervalCount += 1; return intervalCount; },
         clearInterval() {},
+        setTimeout() { return 0; },
         clearTimeout() {}
     });
     const emit = (active, source) => listeners.get('neko:home-tutorial-features-suppressed')({
@@ -580,6 +582,22 @@ test('a screenshot taken before a revocation never rides a later request', () =>
         true,
     );
     assert.equal(crossWindow.screenshot_data, undefined);
+});
+
+test('theater-only proactive mode can schedule independently of mini-games', () => {
+    const state = { proactiveChatEnabled: true, proactiveTheaterInviteEnabled: true };
+    const window = { appState: state, appConst: {}, addEventListener() {} };
+    vm.runInNewContext(source, {
+        window, document: { addEventListener() {}, getElementById() { return null; } },
+        localStorage: { getItem() { return null; } }, console, clearTimeout() {}, clearInterval() {}
+    });
+    assert.equal(window.appProactive.hasAnyChatModeEnabled(), true);
+    assert.equal(window.appProactive.canTriggerProactively(), true);
+    state.proactiveTheaterInviteEnabled = false;
+    assert.equal(!!window.appProactive.hasAnyChatModeEnabled(), false);
+    assert.equal(window.appProactive.canTriggerProactively(), false);
+    state.proactiveMiniGameInviteEnabled = true;
+    assert.equal(window.appProactive.hasAnyChatModeEnabled(), true);
 });
 
 test('typing pushes a nearer proactive tick to 30s after the last input at any interval', async () => {

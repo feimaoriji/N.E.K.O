@@ -355,6 +355,9 @@ def build_plugin_server_app(
     )
 
     app.include_router(plugin_consent_router)
+    from plugin.server.routes.plugin_audit import router as plugin_audit_router
+
+    app.include_router(plugin_audit_router)
     app.include_router(runs_router)
     app.include_router(messages_router)
     app.include_router(metrics_router)
@@ -384,6 +387,8 @@ def build_plugin_server_app(
     app.include_router(knowledge_market_router)
     app.include_router(knowledge_bridge_router)
     app.include_router(market_bridge_router)
+    from plugin.server.routes.theater_market import router as theater_market_router
+    app.include_router(theater_market_router)
     # Keep the Host/Origin guard outside CORS and the cache-header middleware;
     # untrusted requests must not be short-circuited before the guard runs.
     from utils.instance_access import InstanceAccessMiddleware

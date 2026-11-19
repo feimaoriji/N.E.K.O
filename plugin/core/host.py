@@ -32,8 +32,9 @@ from plugin.core.communication import (
     PluginCommunicationResourceManager,
 )
 from plugin.core.context import PluginContext
+from plugin.sdk.shared.core.call_chain_view import call_chain_scope
 from plugin.core.entry_executor import EntryExecutor, execute_entry_command
-from plugin.core.entry_points import normalize_plugin_entry_point
+from plugin.core.entry_points import normalize_plugin_entry_point, plugin_package_matches_directory
 from plugin.core.model_gateway_access import model_gateway_access
 from plugin.core.state import state
 from plugin.core.source_imports import ensure_plugins_namespace as _ensure_plugins_namespace
@@ -237,6 +238,9 @@ if hasattr(os, "register_at_fork"):
     # POSIX only; spawn platforms re-execute children and inherit no such descriptors.
     os.register_at_fork(after_in_child=_close_inherited_host_sockets)
     _FORK_SOCKET_HOOK_REGISTERED = True
+    # A parent thread may hold stdout/stderr buffer locks at fork; see the hook.
+    from plugin._logging_runtime import reopen_inherited_std_streams as _reopen_inherited_std_streams
+    os.register_at_fork(after_in_child=_reopen_inherited_std_streams)
 
 
 # ============================================================================
@@ -530,7 +534,7 @@ def _evict_cached_plugin_source(module_path: str, config_path: Path, logger: Any
     except OSError as exc:
         logger.debug("[Plugin Process] Failed to resolve plugin directory for cache eviction: {}", exc)
         return
-    if plugin_id != plugin_dir.name:
+    if not plugin_package_matches_directory(plugin_id, plugin_dir.name):
         return
 
     package_prefixes = (f"plugins.{plugin_id}", f"plugin.plugins.{plugin_id}")
@@ -567,7 +571,7 @@ def _import_current_plugin_from_config(module_path: str, config_path: Path, logg
         logger.debug("[Plugin Process] Failed to resolve plugin directory for import fallback: {}", exc)
         return None
 
-    if parts[1] != plugin_dir.name:
+    if not plugin_package_matches_directory(parts[1], plugin_dir.name):
         logger.debug(
             "[Plugin Process] Import fallback skipped because module '{}' does not match plugin dir '{}'",
             module_path,
@@ -661,7 +665,7 @@ def _import_plugin_module(module_path: str, config_path: Path | None, logger: An
         canonical = module_path.removeprefix("plugin.")
         parts = canonical.split(".")
         directory = config_path.resolve().parent
-        if len(parts) < 2 or parts[0] != "plugins" or parts[1] != directory.name:
+        if len(parts) < 2 or parts[0] != "plugins" or not plugin_package_matches_directory(parts[1], directory.name):
             raise ValueError("Source-only plugin module must match its source directory")
         package = ".".join(parts[:2])
         _evict_plugin_module_tree(package)
@@ -1480,7 +1484,10 @@ def _plugin_process_runner(
         async def _execute_command(msg: dict):
             logger.info("[Plugin Process] {} entry={} req_id={}", msg.get("type"),
                         msg.get("event_id") or msg.get("entry_id"), msg.get("req_id"))
-            ret = await execute_entry_command(executor, msg)
+            # Host-built call-chain view for ctx.call_chain; covers function,
+            # router and dynamic entries alike since all run through the executor.
+            with call_chain_scope(plugin_id, msg.get("_call_chain")):
+                ret = await execute_entry_command(executor, msg)
             try:
                 await asyncio.to_thread(res_sender.put, ret, timeout=10.0)
             except Exception:

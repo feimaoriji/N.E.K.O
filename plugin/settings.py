@@ -410,33 +410,11 @@ NEKO_AUTH_URL = _validate_http_url(
 # it in main_routers/community_oauth.py — never reuse neko-desktop there.
 NEKO_AUTH_CLIENT_ID = os.getenv("NEKO_AUTH_CLIENT_ID", "neko-desktop").strip() or "neko-desktop"
 
-# Marketplace API URL; configuration enables the marketplace entry in plugin management.
-# Env: NEKO_MARKET_API_URL, default="https://market.project-neko.cn"
-# Legacy env NEKO_MARKET_URL remains supported; environment overrides serve local development.
-MARKET_API_URL = _validate_http_url(
-    os.getenv(
-        "NEKO_MARKET_API_URL",
-        os.getenv("NEKO_MARKET_URL", "https://market.project-neko.cn"),
-    ),
-    name="NEKO_MARKET_API_URL",
-    allow_empty=True,
-)
+# Shared URL policy keeps application and plugin Market origins aligned.
+from utils.market_config import get_market_api_url, get_market_web_url
 
-# Marketplace web URL for detail pages; API calls still use MARKET_API_URL + /api/v1.
-# Local development defaults to frontend Vite port 5173; unset production configuration
-# defaults to MARKET_API_URL's origin.
-# Env: NEKO_MARKET_WEB_URL
-_market_web_url_env = os.getenv("NEKO_MARKET_WEB_URL")
-if _market_web_url_env is not None:
-    MARKET_WEB_URL = _validate_http_url(
-        _market_web_url_env,
-        name="NEKO_MARKET_WEB_URL",
-        allow_empty=True,
-    )
-elif MARKET_API_URL.rstrip("/") in {"http://localhost:8000", "http://127.0.0.1:8000"}:
-    MARKET_WEB_URL = "http://localhost:5173"
-else:
-    MARKET_WEB_URL = MARKET_API_URL
+MARKET_API_URL = get_market_api_url()
+MARKET_WEB_URL = get_market_web_url()
 
 # Allowed Market CORS origins, comma-separated.
 # Allow Market frontends to call local /market/* endpoints cross-origin.
@@ -716,6 +694,15 @@ _sync_policy = os.getenv("NEKO_PLUGIN_SYNC_CALL_POLICY", "warn").lower()
 if _sync_policy not in ("warn", "reject"):
     _sync_policy = "warn"
 SYNC_CALL_IN_HANDLER_POLICY = _sync_policy
+
+# Capability checks along plugin call chains (docs/design/plugin-call-chain.md).
+# - off: no call registry, no checks, no audit.
+# - observe: record would-deny decisions in the audit; never block.
+# - enforce: reserved for the enforcing stages; behaves like observe for now.
+# Env: NEKO_PLUGIN_CAPABILITY_POLICY, default="observe"
+PLUGIN_CAPABILITY_POLICY = os.getenv("NEKO_PLUGIN_CAPABILITY_POLICY", "observe").strip().lower()
+if PLUGIN_CAPABILITY_POLICY not in ("off", "observe", "enforce"):
+    PLUGIN_CAPABILITY_POLICY = "observe"
 
 # ========== Plugin-state persistence ==========
 
@@ -997,6 +984,7 @@ __all__ = [
     "PLUGIN_MESSAGE_FORWARD_LOG_DEDUP_WINDOW_SECONDS",
     "PLUGIN_BUS_CHANGE_LOG_DEDUP_WINDOW_SECONDS",
     "SYNC_CALL_IN_HANDLER_POLICY",
+    "PLUGIN_CAPABILITY_POLICY",
 
     # Message plane
     "MESSAGE_PLANE_ZMQ_RPC_ENDPOINT",

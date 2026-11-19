@@ -24,11 +24,22 @@ from typing import Any
 
 import pytest
 
+from config.prompts import prompts_nekoclaw as texts
 from nekoclaw.runtime.core import InProcessRuntime
+from nekoclaw.runtime.loop.messages import ImageContent, TextContent, ToolResultMessage
 from nekoclaw.runtime.model import LLMClientProvider
-from nekoclaw.runtime.protocol import TaskAgentSpec, GatewaySpec
+from nekoclaw.runtime.protocol import TaskAgentSpec, GatewaySpec, ModelConfig
 from nekoclaw.runtime.session import TaskAgentSession
-from nekoclaw.runtime.tools.gateway import GatewayClient, GatewayError, _last_event_data, build_gateway_tools
+from nekoclaw.runtime.tools import gateway as gateway_module
+from nekoclaw.runtime.tools.base import ToolError
+from nekoclaw.runtime.tools.gateway import (
+    MAX_IMAGES_PER_RESULT,
+    GatewayClient,
+    GatewayError,
+    GatewayResult,
+    _last_event_data,
+    build_gateway_tools,
+)
 from tests.unit.nekoclaw.fakes import Recorder, ScriptedLLM, call, finish, make_spec, open_session, say
 
 pytestmark = pytest.mark.integration_serial
@@ -138,18 +149,245 @@ async def test_handshake_then_tool_list(gateway):
     assert gateway.headers[2]["mcp-protocol-version"] == "2025-06-18"
 
 
-async def test_call_returns_text_and_error_flag(gateway):
+async def test_every_request_is_made_with_the_one_tls_configuration_of_the_process(gateway, monkeypatch):
+    import ssl
+
+    import httpx
+
+    given: list[Any] = []
+    real_client = httpx.AsyncClient
+
+    def client(**kwargs: Any) -> Any:
+        given.append(kwargs.get("verify"))
+        return real_client(**kwargs)
+
+    made: list[Any] = []
+    real_context = httpx.create_ssl_context
+
+    def context(**kwargs: Any) -> Any:
+        made.append(kwargs)
+        return real_context(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    monkeypatch.setattr(httpx, "create_ssl_context", context)
+    monkeypatch.setattr(gateway_module, "_TLS", None)
+
+    # Two sessions: a handshake each, and a call.
+    await GatewayClient(gateway.url, TOKEN).connect()
+    second = GatewayClient(gateway.url, TOKEN)
+    await second.connect()
+    await second.call("plugin__weather__today", {"city": "Lyon"})
+
+    # A client that is given none loads the certificate bundle anew, for every request.
+    assert len(given) == 7 and isinstance(given[0], ssl.SSLContext)
+    assert all(item is given[0] for item in given)
+    # Put together once, and without what the environment says of certificates and proxies.
+    assert made == [{"trust_env": False}]
+
+
+def _picture(data: str = "QUJD", mime: Any = "image/jpeg") -> dict[str, Any]:
+    """One MCP image block as the gateway sends it."""
+    block: dict[str, Any] = {"type": "image", "data": data}
+    if mime is not None:
+        block["mimeType"] = mime
+    return block
+
+
+async def test_call_returns_text_pictures_and_the_error_flag(gateway):
     gateway.results["broken"] = {"content": [{"type": "text", "text": "storage offline"}], "isError": True}
     gateway.results["mixed"] = {
-        "content": [{"type": "text", "text": "one"}, {"type": "image", "data": "..."}, {"type": "text", "text": "two"}]
+        "content": [
+            {"type": "text", "text": "clicked"},
+            _picture("QUJD", "image/jpeg"),
+            {"type": "text", "text": "the window moved"},
+            _picture("REVG", "image/png"),
+            # Neither text nor a picture: passed over.
+            {"type": "resource", "resource": {"uri": "file:///x"}},
+        ]
     }
     client = GatewayClient(gateway.url, TOKEN)
     await client.connect()
 
-    assert await client.call("plugin__weather__today", {"city": "Lyon"}) == ("sunny in Lyon", False)
-    assert await client.call("broken", {}) == ("storage offline", True)
-    assert await client.call("mixed", {}) == ("one\ntwo", False)
-    assert gateway.requests[-3]["params"] == {"name": "plugin__weather__today", "arguments": {"city": "Lyon"}}
+    assert await client.call("plugin__weather__today", {"city": "Lyon"}) == GatewayResult("sunny in Lyon", (), False)
+    assert await client.call("broken", {}) == GatewayResult("storage offline", (), True)
+    # The text parts joined, and the pictures in the order they came. Text
+    # that came as more than one block is also kept as it came.
+    assert await client.call("mixed", {}) == GatewayResult(
+        "clicked\nthe window moved",
+        (ImageContent(data="QUJD", mime_type="image/jpeg"), ImageContent(data="REVG", mime_type="image/png")),
+        False,
+        ("clicked", "the window moved"),
+    )
+    assert gateway.requests[-3]["params"] == {
+        "name": "plugin__weather__today",
+        "arguments": {"city": "Lyon"},
+        "_meta": {"nekoclaw/reply": 0, "nekoclaw/compactions": 0},
+    }
+
+
+async def test_every_call_names_the_reply_of_the_model_it_was_written_in(gateway):
+    from config.nekoclaw_settings import GATEWAY_REPLY_META_KEY
+
+    assert GATEWAY_REPLY_META_KEY == "nekoclaw/reply"
+    client = GatewayClient(gateway.url, TOKEN)
+    await client.connect()
+
+    await client.call("plugin__weather__today", {"city": "Lyon"})
+    client.next_reply()
+    await client.call("plugin__weather__today", {"city": "Nice"})
+    await client.call("plugin__weather__today", {"city": "Metz"})
+    client.next_reply()
+    await client.call("plugin__weather__today", {"city": "Brest"})
+
+    named = [body["params"]["_meta"]["nekoclaw/reply"] for body in gateway.requests if body["method"] == "tools/call"]
+    # The calls of one reply name the same reply, those of the next another.
+    assert named == [0, 1, 1, 2]
+    # Nothing but the calls names one.
+    assert all("_meta" not in (body.get("params") or {}) for body in gateway.requests if body["method"] != "tools/call")
+
+
+async def test_every_call_names_how_often_the_conversation_was_summed_up(gateway):
+    from config.nekoclaw_settings import GATEWAY_COMPACTIONS_META_KEY
+
+    assert GATEWAY_COMPACTIONS_META_KEY == "nekoclaw/compactions"
+    client = GatewayClient(gateway.url, TOKEN)
+    await client.connect()
+
+    await client.call("plugin__weather__today", {"city": "Lyon"})
+    client.compactions = 2
+    await client.call("plugin__weather__today", {"city": "Nice"})
+
+    named = [body["params"]["_meta"] for body in gateway.requests if body["method"] == "tools/call"]
+    assert [meta["nekoclaw/compactions"] for meta in named] == [0, 2]
+
+
+async def test_a_session_tells_the_gateway_when_its_conversation_was_summed_up(tmp_path, gateway):
+    from nekoclaw.runtime.protocol import ModelConfig
+
+    model = ModelConfig(model="fake-model", api_key="k", context_window=32_000, max_output_tokens=2_000)
+    spec = _spec(tmp_path, gateway, model=model)
+
+    def weather(city: str, call_id: str) -> list[Any]:
+        return [call("plugin__weather__today", {"city": city}, call_id), finish("tool_calls")]
+
+    def told() -> list[int]:
+        return [
+            body["params"]["_meta"]["nekoclaw/compactions"] for body in gateway.requests if body["method"] == "tools/call"
+        ]
+
+    llm = ScriptedLLM([weather("Lyon", "c1"), [say("Sunny."), finish()]])
+    session, events = await open_session(spec, llm)
+    try:
+        session.prompt("weather in Lyon")
+        await events.wait_ended()
+        for index in range(4):
+            llm.add(say(f"Step {index}. " + " ".join(f"s{index}w{word}" for word in range(300))), finish())
+            mark = len(events.events)
+            session.prompt(f"Do step {index}.")
+            await events.wait_ended(start=mark)
+        # The next request is refused as too long: the conversation is summed up, and the call after that says so.
+        llm.add(RuntimeError("Error code: 400 - This model's maximum context length is 32000 tokens."))
+        llm.add(say("## Current Work\n- summed up"), finish())
+        llm.add(*weather("Nice", "c2"))
+        llm.add(say("Sunny there too."), finish())
+        mark = len(events.events)
+        session.prompt("and in Nice")
+        await events.wait_ended(start=mark)
+        assert [event["count"] for event in events.of("compacted")] == [1]
+        assert told() == [0, 1]
+    finally:
+        await session.close()
+
+    # A session opened later goes on counting from what its transcript holds.
+    llm = ScriptedLLM([weather("Metz", "c3"), [say("Sunny."), finish()]])
+    session, events = await open_session(spec, llm)
+    try:
+        session.prompt("and in Metz")
+        await events.wait_ended()
+        assert told() == [0, 1, 1]
+    finally:
+        await session.close()
+
+
+async def test_a_session_tells_the_gateway_which_calls_were_written_in_one_reply(tmp_path, gateway):
+    llm = ScriptedLLM(
+        [
+            # Two calls in one reply, then one in the next.
+            [
+                call("plugin__weather__today", {"city": "Lyon"}, "c1"),
+                call("plugin__weather__today", {"city": "Nice"}, "c2", index=1),
+                finish("tool_calls"),
+            ],
+            [call("plugin__weather__today", {"city": "Metz"}, "c3"), finish("tool_calls")],
+            [say("Sunny everywhere."), finish()],
+        ]
+    )
+    session, events = await open_session(_spec(tmp_path, gateway), llm)
+    try:
+        session.prompt("what is the weather in Lyon, Nice and Metz")
+        await events.wait_ended()
+
+        calls = [body["params"] for body in gateway.requests if body["method"] == "tools/call"]
+        assert [params["arguments"]["city"] for params in calls] == ["Lyon", "Nice", "Metz"]
+        first, second, third = (params["_meta"]["nekoclaw/reply"] for params in calls)
+        assert first == second != third
+    finally:
+        await session.close()
+
+
+async def test_more_pictures_than_a_result_may_carry_are_dropped_and_the_text_says_how_many(gateway):
+    shots = [_picture(f"QUJ{n}", "image/png") for n in range(MAX_IMAGES_PER_RESULT + 2)]
+    gateway.results["many"] = {"content": [{"type": "text", "text": "six shots"}, *shots]}
+    client = GatewayClient(gateway.url, TOKEN)
+    await client.connect()
+
+    result = await client.call("many", {})
+
+    assert MAX_IMAGES_PER_RESULT == 4
+    assert [image.data for image in result.images] == ["QUJ0", "QUJ1", "QUJ2", "QUJ3"]
+    assert result.text == "six shots\n[2 picture(s) of this result could not be passed on.]"
+    assert result.parts == ("six shots", "[2 picture(s) of this result could not be passed on.]")
+    assert result.is_error is False
+
+
+async def test_pictures_of_a_kind_a_model_does_not_take_are_dropped_and_the_text_says_so(gateway):
+    gateway.results["odd"] = {
+        "content": [
+            {"type": "text", "text": "a drawing"},
+            _picture("QUJD", "image/svg+xml"),
+            _picture("QUJD", None),
+            _picture("", "image/png"),
+            {"type": "image", "data": 5, "mimeType": "image/png"},
+            _picture("R0lG", "image/gif"),
+            _picture("UklG", "image/webp"),
+        ]
+    }
+    gateway.results["only"] = {"content": [_picture("QUJD", "application/pdf")]}
+    client = GatewayClient(gateway.url, TOKEN)
+    await client.connect()
+
+    odd = await client.call("odd", {})
+    only = await client.call("only", {})
+
+    assert [(image.data, image.mime_type) for image in odd.images] == [("R0lG", "image/gif"), ("UklG", "image/webp")]
+    assert odd.text == "a drawing\n[4 picture(s) of this result could not be passed on.]"
+    # Said even when it is all the result has: the model may be waiting for the picture.
+    assert only == GatewayResult("[1 picture(s) of this result could not be passed on.]", (), False)
+
+
+async def test_an_oversized_picture_is_dropped_and_the_text_says_so(gateway, monkeypatch):
+    monkeypatch.setattr(gateway_module, "MAX_IMAGE_BASE64_CHARS", 16)
+    gateway.results["big"] = {
+        "content": [{"type": "text", "text": "two shots"}, _picture("A" * 16, "image/png"), _picture("B" * 17, "image/png")]
+    }
+    client = GatewayClient(gateway.url, TOKEN)
+    await client.connect()
+
+    result = await client.call("big", {})
+
+    # One at the limit passes; one over it does not.
+    assert [image.data for image in result.images] == ["A" * 16]
+    assert result.text == "two shots\n[1 picture(s) of this result could not be passed on.]"
 
 
 async def test_wrong_token_and_unknown_method_are_errors(gateway):
@@ -176,7 +414,7 @@ async def test_event_stream_answers_are_read(gateway):
     definitions = await client.connect()
 
     assert [definition["name"] for definition in definitions] == ["plugin__weather__today"]
-    assert await client.call("plugin__weather__today", {"city": "Nice"}) == ("sunny in Nice", False)
+    assert await client.call("plugin__weather__today", {"city": "Nice"}) == GatewayResult("sunny in Nice", (), False)
 
 
 def test_last_data_block_of_an_event_stream():
@@ -202,6 +440,102 @@ def test_gateway_cannot_replace_or_unhide_a_tool():
     assert tools[0].description == "fine"
     assert tools[0].parameters == {"type": "object", "properties": {}}
     assert tools[0].execution_mode == "sequential"
+
+
+class _Answers:
+    """Stands in for the client: every call comes back with the result it was given."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> GatewayResult:
+        self.calls.append((name, dict(arguments)))
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+async def _forward(result: Any, arguments: dict[str, Any] | None = None) -> Any:
+    """Run the tool the runtime builds for a gateway tool named ``computer``."""
+    client = _Answers(result)
+    definition = {
+        "name": "computer",
+        "description": "Operate the desktop.",
+        "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}}},
+    }
+    (tool,) = build_gateway_tools(client, [definition])
+    outcome = await tool.execute("call-1", arguments or {"action": "click"})
+    assert client.calls == [("computer", arguments or {"action": "click"})]
+    return outcome
+
+
+async def test_the_pictures_of_a_result_follow_its_text_in_the_tool_result():
+    first = ImageContent(data="QUJD", mime_type="image/jpeg")
+    second = ImageContent(data="REVG", mime_type="image/png")
+
+    outcome = await _forward(GatewayResult("clicked", (first, second), False))
+
+    assert outcome.content == [TextContent(text="clicked"), first, second]
+
+
+async def test_a_result_of_text_alone_is_a_tool_result_of_text_alone():
+    assert (await _forward(GatewayResult("clicked", (), False))).content == [TextContent(text="clicked")]
+    assert (await _forward(GatewayResult("", (), False))).content == [TextContent(text="(no output)")]
+
+
+async def test_a_result_of_several_texts_stays_several_blocks_that_read_as_the_one_text():
+    shot = ImageContent(data="QUJD", mime_type="image/jpeg")
+    parts = ("the tools of a group", "what the call returned", "[1 picture(s) of this result could not be passed on.]")
+    text = "\n".join(parts)
+
+    outcome = await _forward(GatewayResult(text, (shot,), False, parts))
+    wordless = await _forward(GatewayResult(text, (), False, parts))
+
+    # A block each, in the order they came, and the pictures after them: the
+    # runtime cuts an old result block by block.
+    assert outcome.content == [
+        TextContent(text="the tools of a group\n"),
+        TextContent(text="what the call returned\n"),
+        TextContent(text="[1 picture(s) of this result could not be passed on.]"),
+        shot,
+    ]
+    # Put together they read as the one text did.
+    assert outcome.text == text
+    # The same without a picture.
+    assert wordless.content == outcome.content[:3]
+
+
+async def test_an_error_result_of_several_texts_is_raised_with_all_of_them():
+    parts = ("the tools of a group", "the user declined")
+    with pytest.raises(ToolError) as refused:
+        await _forward(GatewayResult("\n".join(parts), (), True, parts))
+
+    assert str(refused.value) == "the tools of a group\nthe user declined"
+
+
+async def test_a_picture_without_a_word_still_gets_a_line_of_text_in_front():
+
+    shot = ImageContent(data="QUJD", mime_type="image/jpeg")
+
+    outcome = await _forward(GatewayResult("", (shot,), False))
+
+    assert outcome.content == [TextContent(text="(no output)"), shot]
+
+
+async def test_an_error_result_is_raised_with_its_text():
+    shot = ImageContent(data="QUJD", mime_type="image/jpeg")
+
+    with pytest.raises(ToolError) as refused:
+        await _forward(GatewayResult("The desktop is in use by another task.", (shot,), True))
+    with pytest.raises(ToolError) as wordless:
+        await _forward(GatewayResult("", (), True))
+    with pytest.raises(ToolError) as unreachable:
+        await _forward(GatewayError("HTTP 401: unknown or missing token"))
+
+    assert str(refused.value) == "The desktop is in use by another task."
+    assert str(wordless.value) == "computer failed"
+    assert str(unreachable.value) == "computer failed: HTTP 401: unknown or missing token"
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +566,30 @@ async def test_session_offers_gateway_tools_next_to_the_built_in_ones(tmp_path, 
         assert llm.requests[1][-1] == {"role": "tool", "tool_call_id": "call-1", "content": "sunny in Lyon"}
         end = events.of("tool_end")[0]
         assert (end["tool_name"], end["is_error"], end["text"]) == ("plugin__weather__today", False, "sunny in Lyon")
+    finally:
+        await session.close()
+
+
+async def test_a_group_is_loaded_with_its_name_alone_through_the_search_tool_of_a_session_opened_without_groups(
+    tmp_path, gateway
+):
+    from nekoclaw.host.gateway import CALL_TOOL, SEARCH_TOOL, _CALL_TOOL_DEFINITION, _search_tool_definition
+
+    # As the host lists its two tools while no group of built-in tools can be used.
+    gateway.tools = [_search_tool_definition([]), _CALL_TOOL_DEFINITION]
+    gateway.results[SEARCH_TOOL] = {"content": [{"type": "text", "text": "the browser tools"}], "isError": False}
+    llm = ScriptedLLM([[call(SEARCH_TOOL, {"group": "browser"}), finish("tool_calls")], [say("Loaded."), finish()]])
+    session, events = await open_session(_spec(tmp_path, gateway), llm)
+    try:
+        assert {SEARCH_TOOL, CALL_TOOL} <= set(events.of("started")[0]["tools"])
+        session.prompt("open the page")
+        await events.wait_ended()
+
+        # The call reaches the gateway: the definition the session keeps does not ask for a query.
+        asked = [body["params"] for body in gateway.requests if body.get("method") == "tools/call"]
+        assert [(item["name"], item["arguments"]) for item in asked] == [(SEARCH_TOOL, {"group": "browser"})]
+        end = events.of("tool_end")[0]
+        assert (end["tool_name"], end["is_error"], end["text"]) == (SEARCH_TOOL, False, "the browser tools")
     finally:
         await session.close()
 
@@ -273,6 +631,113 @@ async def test_error_result_reaches_the_model_as_an_error(tmp_path, gateway):
         end = events.of("tool_end")[0]
         assert end["is_error"] is True
         assert end["text"] == "Error: permission denied: the user declined"
+    finally:
+        await session.close()
+
+
+def _pictures(request: list[dict[str, Any]]) -> list[str]:
+    """The pictures one model request carries, as their data URLs."""
+    return [
+        part["image_url"]["url"]
+        for message in request
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if part.get("type") == "image_url"
+    ]
+
+
+def _seeing() -> ModelConfig:
+    return ModelConfig(model="fake-model", api_key="test-key", supports_images=True)
+
+
+async def test_a_screenshot_from_a_gateway_tool_reaches_the_model_after_the_tools_text(tmp_path, gateway):
+    gateway.results["plugin__weather__today"] = {
+        "content": [{"type": "text", "text": "the sky over Lyon"}, _picture("QUJD", "image/jpeg")],
+        "isError": False,
+    }
+    llm = ScriptedLLM([[call("plugin__weather__today", {"city": "Lyon"}), finish("tool_calls")], [say("Sunny."), finish()]])
+    session, events = await open_session(_spec(tmp_path, gateway, model=_seeing()), llm)
+    try:
+        session.prompt("what does the sky look like")
+        await events.wait_ended()
+
+        (result,) = [message for message in session.harness.message_list if isinstance(message, ToolResultMessage)]
+        assert result.content == [
+            TextContent(text="the sky over Lyon"),
+            ImageContent(data="QUJD", mime_type="image/jpeg"),
+        ]
+        assert result.is_error is False
+        second = llm.requests[1]
+        assert {"role": "tool", "tool_call_id": "call-1", "content": "the sky over Lyon"} in second
+        assert _pictures(second) == ["data:image/jpeg;base64,QUJD"]
+    finally:
+        await session.close()
+
+
+async def test_a_model_that_sees_no_pictures_gets_a_placeholder_for_the_screenshot(tmp_path, gateway):
+    gateway.results["plugin__weather__today"] = {
+        "content": [{"type": "text", "text": "the sky over Lyon"}, _picture("QUJD", "image/jpeg")],
+        "isError": False,
+    }
+    llm = ScriptedLLM([[call("plugin__weather__today", {"city": "Lyon"}), finish("tool_calls")], [say("Sunny."), finish()]])
+    session, events = await open_session(_spec(tmp_path, gateway), llm)
+    try:
+        session.prompt("what does the sky look like")
+        await events.wait_ended()
+
+        second = llm.requests[1]
+        assert _pictures(second) == []
+        assert second[-1] == {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "the sky over Lyon\n[image omitted: the model does not accept images]",
+        }
+    finally:
+        await session.close()
+
+
+@pytest.mark.parametrize("pooled", [True, False])
+async def test_tools_of_one_pool_share_the_screenshots_that_stay_in_the_conversation(tmp_path, gateway, pooled):
+    empty = {"type": "object", "properties": {}}
+    gateway.tools[:] = [
+        {"name": "browser_click", "description": "Click an element.", "inputSchema": empty},
+        {"name": "browser_take_screenshot", "description": "Take a screenshot.", "inputSchema": empty},
+    ]
+    gateway.results["browser_click"] = {"content": [{"type": "text", "text": "clicked"}, _picture("QUJD")]}
+    gateway.results["browser_take_screenshot"] = {"content": [{"type": "text", "text": "the page"}, _picture("REVG")]}
+    llm = ScriptedLLM(
+        [
+            [call("browser_click", {}, "c1"), finish("tool_calls")],
+            [call("browser_take_screenshot", {}, "c2"), finish("tool_calls")],
+            [say("Done."), finish()],
+        ]
+    )
+    names = ("browser_click", "browser_take_screenshot")
+    spec = _spec(
+        tmp_path,
+        gateway,
+        model=_seeing(),
+        image_retention={name: 1 for name in names},
+        image_pools={name: "browser" for name in names} if pooled else {},
+    )
+    session, events = await open_session(spec, llm)
+    try:
+        assert session.context.image_retention == {name: 1 for name in names}
+        assert session.context.image_pools == ({name: "browser" for name in names} if pooled else {})
+
+        session.prompt("click, then look")
+        await events.wait_ended()
+
+        assert _pictures(llm.requests[1]) == ["data:image/jpeg;base64,QUJD"]
+        earlier = next(message for message in llm.requests[2] if message.get("tool_call_id") == "c1")
+        if pooled:
+            # One screenshot for the browser as a whole: the newer one.
+            assert _pictures(llm.requests[2]) == ["data:image/jpeg;base64,REVG"]
+            assert earlier["content"] == f"clicked{texts.IMAGE_OMITTED_PLACEHOLDER}"
+        else:
+            # One for each tool.
+            assert _pictures(llm.requests[2]) == ["data:image/jpeg;base64,QUJD", "data:image/jpeg;base64,REVG"]
+            assert earlier["content"] == "clicked"
     finally:
         await session.close()
 

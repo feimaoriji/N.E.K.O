@@ -1933,7 +1933,7 @@ function createSidePanelContainer(manager, prefix, options = {}) {
     container.setAttribute('data-neko-sidepanel', '');
     const getInteractionGuardDelay = () => {
         const sidePanelType = container.getAttribute('data-neko-sidepanel-type') || '';
-        if (sidePanelType === 'agent-user-plugin-actions' || sidePanelType === 'agent-openclaw-actions') {
+        if (sidePanelType === 'agent-user-plugin-actions') {
             return 220;
         }
         return 0;
@@ -2154,7 +2154,6 @@ function attachSidePanelHover(manager, prefix, anchorEl, sidePanel) {
 
         return [
             'agent-user-plugin-actions',
-            'agent-openclaw-actions',
             'chat-settings',
             'animation-settings',
             'cat-settings',
@@ -3033,6 +3032,12 @@ function createSettingsToggleItem(manager, prefix, toggle) {
             } else if (!isChecked && typeof window.stopProactiveChatSchedule === 'function') {
                 window.stopProactiveChatSchedule();
             }
+            // Proactive vision (voice-call viewing, text-chat screenshots) needs
+            // this switch too; acquire the stream on this click, since it was
+            // released when the switch went off and later captures never prompt.
+            if (isChecked && typeof window.acquireProactiveVisionAfterUserEnable === 'function') {
+                window.acquireProactiveVisionAfterUserEnable();
+            }
         } else if (toggle.id === 'proactive-vision') {
             const visionEnabled = toggle.inverted ? !isChecked : isChecked;
             window.proactiveVisionEnabled = visionEnabled;
@@ -3040,13 +3045,19 @@ function createSettingsToggleItem(manager, prefix, toggle) {
                 window.saveNEKOSettings();
             }
             if (visionEnabled) {
-                if (typeof window.acquireProactiveVisionStream === 'function') {
-                    window.acquireProactiveVisionStream();
+                // Same click entry as the two switches: it prefetches the screen
+                // stream only when something will use it (speech heartbeat or
+                // text-chat screenshots), skips an open manual-share picker or
+                // a pending acquisition, and sends a frame once it arrives.
+                if (typeof window.acquireProactiveVisionAfterUserEnable === 'function') {
+                    window.acquireProactiveVisionAfterUserEnable();
                 }
                 if (typeof window.resetProactiveChatBackoff === 'function') {
                     window.resetProactiveChatBackoff();
                 }
-                if (typeof window.isRecording !== 'undefined' && window.isRecording) {
+                if (typeof window.isRecording !== 'undefined' && window.isRecording
+                    && typeof window.canProactiveVisionRunDuringSpeech === 'function'
+                    && window.canProactiveVisionRunDuringSpeech() === true) {
                     if (typeof window.startProactiveVisionDuringSpeech === 'function') {
                         window.startProactiveVisionDuringSpeech();
                     }

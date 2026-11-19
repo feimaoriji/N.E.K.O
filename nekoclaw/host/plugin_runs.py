@@ -552,12 +552,25 @@ class PluginRunner:
         latest_user_request: str = "",
         on_progress: ProgressCallback | None = None,
         on_run_created: Callable[[str], Awaitable[None]] | None = None,
+        housekeeping: bool = False,
+        still_wanted: Callable[[], bool] | None = None,
     ) -> RunOutcome:
         """Call one plugin entry and wait for the run to end.
 
         Never raises for a failed call; the outcome says what happened. When
         the caller is cancelled while waiting, the run is cancelled on the
         plugin server as well.
+
+        ``housekeeping`` is for a call the host makes on its own account and
+        no model chose (handing a deferred task's id to the plugin's
+        ``bind_task`` entry): such an entry may be hidden from selection, so
+        the entry is looked for among all of the plugin's entries.
+
+        ``still_wanted`` is asked in the task that sends the request,
+        as it begins and before the HTTP client is made
+        (``_create_run``): a call that is not wanted any more is not
+        made (``not_wanted``). What the client itself waits for before
+        the request is on the wire is past that.
         """
         plugin_args = dict(args) if isinstance(args, dict) else {}
         requested_entry = entry_id or plugin_args.pop("_entry", None)
@@ -586,7 +599,12 @@ class PluginRunner:
             return rejected(f"Plugin {plugin_id} not found", "Plugin not found")
 
         entries_listed = isinstance(plugin.get("entries"), list)
-        known = [str(item.get("id")) for item in visible_entries(plugin) if item.get("id")]
+        listed = (
+            [item for item in plugin.get("entries") or [] if isinstance(item, dict)]
+            if housekeeping
+            else visible_entries(plugin)
+        )
+        known = [str(item.get("id")) for item in listed if item.get("id")]
         if entries_listed and not known:
             return rejected(f"Plugin {plugin_id} has no Agent-visible entries", "no_agent_visible_entries")
         if entries_listed and not requested_entry:
@@ -619,7 +637,10 @@ class PluginRunner:
         try:
             ctx = safe_args.get("_ctx")
             ctx = dict(ctx) if isinstance(ctx, dict) else {}
-            if lanlan_name and "lanlan_name" not in ctx:
+            # The host's character name wins over one the model wrote into
+            # the arguments: which character the call is for is the host's
+            # to say (owner, 2026-11-13).
+            if lanlan_name:
                 ctx["lanlan_name"] = lanlan_name
             if conversation_id:
                 ctx["conversation_id"] = conversation_id
@@ -654,7 +675,7 @@ class PluginRunner:
         # exist on the plugin server, so a caller that is cancelled meanwhile
         # must not take the request down with it: the answer is still read,
         # and the run it names is cancelled.
-        request = asyncio.ensure_future(self._create_run(body))
+        request = asyncio.ensure_future(self._create_run(body, still_wanted))
         self._cancel_tasks.add(request)
         request.add_done_callback(self._cancel_tasks.discard)
         try:
@@ -732,9 +753,22 @@ class PluginRunner:
             stage=completion.get("stage"),
         )
 
-    async def _create_run(self, body: dict[str, Any]) -> tuple[Any, tuple[str, str] | None]:
-        """Send ``POST /runs``. Returns ``(answer, None)`` or ``(None, (error, reason))``."""
+    async def _create_run(
+        self, body: dict[str, Any], still_wanted: Callable[[], bool] | None = None
+    ) -> tuple[Any, tuple[str, str] | None]:
+        """Send ``POST /runs``. Returns ``(answer, None)`` or ``(None, (error, reason))``.
+
+        ``still_wanted`` is asked here, as this begins, and not where
+        this is started: it runs as a task of its own, which begins a
+        moment after it is made. Before the client is made: a client
+        that cannot be made is a call that failed, and that is not
+        what is told of a call nobody wants any more.
+        """
         target = f"{body.get('plugin_id')}.{body.get('entry_id')}"
+        if still_wanted is not None and not still_wanted():
+            # Whoever handed the call over no longer wants it made (NekoClaw
+            # was switched off since it was chosen): nothing is sent.
+            return None, ("the call is not wanted any more", "not_wanted")
         try:
             async with self._client() as client:
                 response = await client.post(f"{self.base_url}/runs", json=body)

@@ -10,11 +10,17 @@ import re
 import stat
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from plugin._types.entry_metadata import (
+    ENTRY_CONTRACT_BOOL_FIELDS,
+    ENTRY_CONTRACT_FIELDS,
+    ENTRY_CONTRACT_MAPPING_FIELDS,
+)
 from plugin._types.plugin_types import (
     SUPPORTED_PLUGIN_TYPES,
     format_plugin_type_choice_error,
     format_removed_plugin_host,
 )
+from plugin.core.entry_points import plugin_package_matches_directory
 from plugin.sdk.shared.core.push_message_schema import (
     LEGACY_PUSH_MESSAGE_FIELD_MIGRATIONS,
     LEGACY_PUSH_MESSAGE_POSITIONAL_FIELDS,
@@ -28,6 +34,11 @@ from ..core.plugin_source import load_plugin_source
 from ..core.toml_utils import load_toml
 
 _PLUGIN_RUNTIME_TIMEOUT_MAX = 300.0
+_PLUGIN_ENTRIES_MAX = 1024
+_PLUGIN_ENTRY_FIELDS_MAX = 64
+_PLUGIN_ENTRY_KEY_LENGTH_MAX = 256
+# Fields the registry coerces with bool(), so "false" would read as True.
+_PLUGIN_ENTRY_BOOL_FIELDS = ENTRY_CONTRACT_BOOL_FIELDS
 
 
 def validate_plugin_dir(
@@ -68,7 +79,9 @@ def validate_plugin_dir(
         return issues
     plugin_table = source.plugin_table
     _check_plugin_toml_schema(plugin_dir, source.plugin_toml, source.plugin_id, issues)
-    if require_matching_directory_name and source.plugin_id != plugin_dir.name:
+    if require_matching_directory_name and not plugin_package_matches_directory(
+        source.plugin_id, plugin_dir.name
+    ):
         issues.append(
             (
                 "warning",
@@ -160,6 +173,7 @@ def _check_plugin_toml_schema(
         "passive",
         "version",
         "entry",
+        "entries",
         "author",
         "i18n",
         "sdk",
@@ -172,6 +186,7 @@ def _check_plugin_toml_schema(
         "dependency",
         "dependencies",
         "previous_ids",
+        "shared",
     }
     _warn_unknown_keys(plugin_table, allowed_plugin_keys, "[plugin]", issues)
 
@@ -196,11 +211,13 @@ def _check_plugin_toml_schema(
     _check_author_table(plugin_table.get("author"), issues)
     _check_sdk_table(plugin_table.get("sdk"), issues)
     _check_store_table(plugin_table.get("store"), issues)
+    _check_shared_table(plugin_table.get("shared"), issues)
     _check_i18n_table(plugin_dir, plugin_table.get("i18n"), issues)
     _check_install_table(plugin_dir, plugin_table.get("install"), issues)
     _check_safety_table(plugin_table.get("safety"), issues)
     _check_config_profiles_table(plugin_table.get("config_profiles"), issues)
     _check_dependency_tables(plugin_table.get("dependency"), issues)
+    _check_entries(plugin_table.get("entries"), issues)
     _check_ui_table(plugin_dir, plugin_table.get("ui"), issues)
     _check_runtime_table(config.get("plugin_runtime"), issues)
     _check_plugin_state_table(config.get("plugin_state"), issues)
@@ -404,6 +421,21 @@ def _check_store_table(value: object, issues: list[tuple[str, str]]) -> None:
     backend = value.get("backend")
     if backend is not None:
         _check_enum(backend, "[plugin.store].backend", {"file", "sqlite", "memory"}, issues)
+
+
+def _check_shared_table(value: object, issues: list[tuple[str, str]]) -> None:
+    """Check ``[plugin.shared]``: the plugins whose shared files this one reads."""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        issues.append(("error", "[plugin.shared] must be a table"))
+        return
+    _warn_unknown_keys(value, {"reads"}, "[plugin.shared]", issues)
+    reads = value.get("reads")
+    if isinstance(reads, str):
+        # One id may be written without the brackets; the plugin is run with it read so.
+        reads = [reads]
+    _check_string_list(reads, "[plugin.shared].reads", issues, required=False)
 
 
 def _check_i18n_table(plugin_dir: Path, value: object, issues: list[tuple[str, str]]) -> None:
@@ -633,6 +665,186 @@ def _check_dependency_tables(value: object, issues: list[tuple[str, str]]) -> No
             _check_string_list(conflicts, f"{label}.conflicts", issues, required=False)
 
 
+def _check_entries(value: object, issues: list[tuple[str, str]]) -> None:
+    if value is None:
+        return
+    # Bound iteration, unknown-key sorting and diagnostic size before scanning.
+    if isinstance(value, (list, dict)):
+        if len(value) > _PLUGIN_ENTRIES_MAX:
+            issues.append((
+                "error",
+                f"[plugin].entries exceeds {_PLUGIN_ENTRIES_MAX} entries / "
+                f"[plugin].entries 超过 {_PLUGIN_ENTRIES_MAX} 个条目 / "
+                f"[plugin].entries が {_PLUGIN_ENTRIES_MAX} 件を超えています",
+            ))
+            return
+        if isinstance(value, dict) and any(len(key) > _PLUGIN_ENTRY_KEY_LENGTH_MAX for key in value):
+            issues.append((
+                "error",
+                f"[plugin].entries keys must not exceed {_PLUGIN_ENTRY_KEY_LENGTH_MAX} characters / "
+                f"[plugin].entries 键名不能超过 {_PLUGIN_ENTRY_KEY_LENGTH_MAX} 个字符 / "
+                f"[plugin].entries のキーは {_PLUGIN_ENTRY_KEY_LENGTH_MAX} 文字以内にしてください",
+            ))
+            return
+        for item in value.values() if isinstance(value, dict) else value:
+            if not isinstance(item, dict):
+                continue
+            if len(item) > _PLUGIN_ENTRY_FIELDS_MAX:
+                issues.append((
+                    "error",
+                    f"[plugin].entries tables must not exceed {_PLUGIN_ENTRY_FIELDS_MAX} fields / "
+                    f"[plugin].entries 表不能超过 {_PLUGIN_ENTRY_FIELDS_MAX} 个字段 / "
+                    f"[plugin].entries のテーブルは {_PLUGIN_ENTRY_FIELDS_MAX} フィールド以内にしてください",
+                ))
+                return
+            if any(len(key) > _PLUGIN_ENTRY_KEY_LENGTH_MAX for key in item):
+                issues.append((
+                    "error",
+                    f"[plugin].entries field names must not exceed {_PLUGIN_ENTRY_KEY_LENGTH_MAX} characters / "
+                    f"[plugin].entries 字段名不能超过 {_PLUGIN_ENTRY_KEY_LENGTH_MAX} 个字符 / "
+                    f"[plugin].entries のフィールド名は {_PLUGIN_ENTRY_KEY_LENGTH_MAX} 文字以内にしてください",
+                ))
+                return
+    # id plus the display fields registry copies, union the shared contract tuple.
+    allowed = {"id", "name", "description", "input_schema"} | set(ENTRY_CONTRACT_FIELDS)
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            label = f"[plugin].entries[{index}]"
+            # The registry also takes a bare string item as the entry id.
+            if isinstance(item, str):
+                if not item.strip():
+                    issues.append((
+                        "warning",
+                        f"{label} is a blank entry id / "
+                        f"{label} 是空的入口 id / {label} のエントリ id が空です",
+                    ))
+                continue
+            if not isinstance(item, dict):
+                issues.append((
+                    "error",
+                    f"{label} must be a table or entry id string / "
+                    f"{label} 必须是表或入口 id 字符串 / "
+                    f"{label} はテーブルまたはエントリ id 文字列である必要があります",
+                ))
+                continue
+            _warn_unknown_keys(item, allowed, label, issues)
+            _check_entry_field_types(item, label, issues)
+            # The registry skips a list item whose id is missing or blank.
+            # Truthiness avoids recursively stringifying a structured TOML value.
+            entry_id = item.get("id")
+            if not entry_id or (isinstance(entry_id, str) and not entry_id.strip()):
+                issues.append((
+                    "warning",
+                    f"{label}.id is missing or blank / "
+                    f"{label}.id 缺失或为空 / {label}.id が未指定または空です",
+                ))
+        return
+    if isinstance(value, dict):
+        # The registry iterates a keyed table by key, so the declared fields
+        # never reach the entry. Flag it until the runtime normalizes it.
+        if value:
+            issues.append((
+                "warning",
+                "[plugin].entries as a keyed table is not applied at runtime; "
+                "its declared fields are ignored. Use [[plugin.entries]] with id = \"...\" instead / "
+                "[plugin].entries 的键控表形式在运行时不会生效，其声明字段会被忽略，"
+                "请改用 [[plugin.entries]] 并填写 id / "
+                "[plugin].entries のキー付きテーブル形式は実行時に反映されず、宣言したフィールドは無視されます。"
+                "[[plugin.entries]] と id を使用してください",
+            ))
+        for entry_id, item in value.items():
+            label = f"[plugin].entries.{entry_id}"
+            if not isinstance(item, dict):
+                issues.append((
+                    "error",
+                    f"{label} must be a table / {label} 必须是表 / {label} はテーブルである必要があります",
+                ))
+                continue
+            _warn_unknown_keys(item, allowed, label, issues)
+            _check_entry_field_types(item, label, issues, applied=False)
+        return
+    issues.append((
+        "error",
+        "[plugin].entries must be a table or array of tables / "
+        "[plugin].entries 必须是表或表数组 / "
+        "[plugin].entries はテーブルまたはテーブルの配列である必要があります",
+    ))
+
+
+def _check_entry_field_types(
+    item: dict[str, object],
+    label: str,
+    issues: list[tuple[str, str]],
+    *,
+    applied: bool = True,
+) -> None:
+    for key in _PLUGIN_ENTRY_BOOL_FIELDS:
+        _check_entry_bool(item.get(key), f"{label}.{key}", issues)
+    _check_entry_timeout(item.get("timeout"), f"{label}.timeout", issues)
+    for key in ENTRY_CONTRACT_MAPPING_FIELDS:
+        if key in item and not isinstance(item[key], dict):
+            # Warning, not error: these fields were never checked before.
+            if applied:
+                # The registry coerces a non-table to an empty mapping, silently.
+                message = (
+                    f"{label}.{key} must be a table; the registry replaces any other value with an empty table / "
+                    f"{label}.{key} 必须是表，其他值会被注册表替换为空表 / "
+                    f"{label}.{key} はテーブルである必要があります。それ以外の値は空のテーブルに置き換えられます"
+                )
+            else:
+                message = (
+                    f"{label}.{key} must be a table / {label}.{key} 必须是表 / "
+                    f"{label}.{key} はテーブルである必要があります"
+                )
+            issues.append(("warning", message))
+    # A keyed table is not applied at all (warned separately): no publish hint.
+    for key in ("output_schema", "strict_output") if applied else ():
+        if key in item:
+            # The registry drops it: the output check runs from the decorator.
+            issues.append((
+                "warning",
+                f"{label}.{key} is ignored; declare it on @plugin_entry instead / "
+                f"{label}.{key} 会被忽略，请在 @plugin_entry 上声明 / "
+                f"{label}.{key} は無視されます。@plugin_entry で宣言してください",
+            ))
+
+
+def _check_entry_bool(value: object, label: str, issues: list[tuple[str, str]]) -> None:
+    # Unlike _check_optional_bool, no string spelling is safe here: the registry
+    # applies bool(), so "false", "no", "0" and "off" all read as True.
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, str):
+        issues.append((
+            "error",
+            f"{label} must be true/false, not a string; the registry reads any non-empty string as true",
+        ))
+        return
+    issues.append(("error", f"{label} must be a boolean"))
+
+
+def _check_entry_timeout(value: object, label: str, issues: list[tuple[str, str]]) -> None:
+    # Mirrors resolve_entry_timeout(): it accepts anything float() reads, treats
+    # <= 0 as "no per-entry timeout", and silently falls back on anything else.
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        issues.append(("error", f"{label} must be a number"))
+        return
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        issues.append(("error", f"{label} must be a number"))
+        return
+    if not math.isfinite(number):
+        issues.append(("error", f"{label} must be finite"))
+        return
+    if isinstance(value, str):
+        issues.append(("warning", f"{label} uses string number '{value}'; prefer a number"))
+    if number < 0:
+        issues.append(("warning", f"{label} is negative, which disables the entry timeout; use 0 for that"))
+
+
 def _check_ui_table(plugin_dir: Path, value: object, issues: list[tuple[str, str]]) -> None:
     if value is None:
         return
@@ -833,6 +1045,9 @@ def _check_python_decorators(plugin_dir: Path, issues: list[tuple[str, str]]) ->
                     entry_id = _decorator_keyword_string(decorator, "id") or node.name
                     _check_identifier(entry_id, f"@plugin_entry id in {relative}:{node.lineno}", issues)
                     _check_schema_keyword(decorator, "input_schema", f"{relative}:{node.lineno}", issues)
+                    # An entry may return a non-object (a list, a string), so no type='object' hint here.
+                    _check_schema_keyword(decorator, "output_schema", f"{relative}:{node.lineno}", issues, expect_object=False)
+                    _check_output_schema_literal(decorator, f"{relative}:{node.lineno}", issues)
                     _check_mutually_exclusive(decorator, {"input_schema", "params"}, f"@plugin_entry in {relative}:{node.lineno}", issues)
                     _check_mutually_exclusive(decorator, {"llm_result_fields", "llm_result_model", "fields"}, f"@plugin_entry in {relative}:{node.lineno}", issues)
                     previous = seen_ids.get(entry_id)
@@ -1000,14 +1215,21 @@ def _check_identifier(value: str, label: str, issues: list[tuple[str, str]]) -> 
         issues.append(("warning", f"{label} should contain only A-Z, a-z, 0-9, _, -"))
 
 
-def _check_schema_keyword(decorator: ast.expr, keyword: str, label: str, issues: list[tuple[str, str]]) -> None:
+def _check_schema_keyword(
+    decorator: ast.expr,
+    keyword: str,
+    label: str,
+    issues: list[tuple[str, str]],
+    *,
+    expect_object: bool = True,
+) -> None:
     value = _decorator_keyword_literal(decorator, keyword)
     if value is None:
         return
     if not isinstance(value, dict):
         issues.append(("error", f"{keyword} in {label} must be a dict literal when statically declared"))
         return
-    if value.get("type") != "object":
+    if expect_object and value.get("type") != "object":
         issues.append(("warning", f"{keyword} in {label} should declare type='object'"))
     properties = value.get("properties")
     if properties is not None and not isinstance(properties, dict):
@@ -1015,6 +1237,17 @@ def _check_schema_keyword(decorator: ast.expr, keyword: str, label: str, issues:
     required = value.get("required")
     if required is not None and not isinstance(required, list):
         issues.append(("error", f"{keyword}.required in {label} must be a list"))
+
+
+def _check_output_schema_literal(decorator: ast.expr, label: str, issues: list[tuple[str, str]]) -> None:
+    """An explicit output_schema, like input_schema, is published but not checked at runtime."""
+    if not isinstance(_decorator_keyword_literal(decorator, "output_schema"), dict):
+        return  # not a dict literal: reported by the shape check, or not static
+    issues.append((
+        "warning",
+        f"output_schema in {label} is published only; the runtime does not validate returns against it "
+        f"(annotate the return with a Pydantic model for a runtime check)",
+    ))
 
 
 def _check_mutually_exclusive(decorator: ast.expr, names: set[str], label: str, issues: list[tuple[str, str]]) -> None:

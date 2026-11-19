@@ -35,10 +35,14 @@ from nekoclaw.host.decision import (
     is_capability_question,
     parse_json_object,
     parse_permission_choice,
+    read_answer,
 )
 from nekoclaw.host.ledger import Commission
 from tests.unit.nekoclaw.host_fakes import FakeDecisionLLM, pick_plugin
 from tests.unit.nekoclaw.plugin_server_fake import entry, plugin
+
+
+LANGUAGES = ["zh", "zh-TW", "en", "ja", "ko", "ru", "es", "pt"]
 
 
 def commission(commission_id: str, dispatch_text: str, **values: Any) -> Commission:
@@ -334,6 +338,142 @@ async def test_addition_cannot_go_to_a_plugin_run():
     assert triage.kind == "new"
 
 
+def _over(commission_id: str, dispatch_text: str, **values: Any) -> Commission:
+    """A commission a task agent worked on that is over, in a session of its own."""
+    values.setdefault("status", "done")
+    values.setdefault("route", "task_agent")
+    values.setdefault("session_id", commission_id)
+    return commission(commission_id, dispatch_text, **values)
+
+
+async def test_an_addition_to_a_commission_that_is_over_goes_on_with_it():
+    recent = [
+        _over("c9", "查一下上海明天的天气", route="plugin", session_id=None),
+        _over("c3", "写一个整理发票的脚本"),
+        _over("c1", "整理下载文件夹里的照片", result_summary="照片已按月份分到 D:/Photos"),
+    ]
+    llm = FakeDecisionLLM()
+
+    triage = await LexicalDecisionModel(llm).triage(
+        request("另外照片里的截图单独放一个文件夹", recent=recent, task_agent_available=True)
+    )
+
+    assert llm.calls == []
+    assert (triage.kind, triage.targets) == ("continue", ["c1"])
+    # What it came to counts as well as what it was.
+    by_result = await LexicalDecisionModel(llm).triage(
+        request("对了 D:/Photos 那边还有重复的", recent=recent, task_agent_available=True)
+    )
+    assert (by_result.kind, by_result.targets) == ("continue", ["c1"])
+
+
+async def test_what_is_under_way_takes_an_addition_before_what_is_over():
+    active = [commission("c1", "整理下载文件夹里的照片", route="task_agent")]
+    recent = [_over("c2", "整理下载文件夹里的照片并发到相册")]
+
+    triage = await LexicalDecisionModel(FakeDecisionLLM()).triage(
+        request("另外照片按月份分文件夹", active=active, recent=recent, task_agent_available=True)
+    )
+
+    assert (triage.kind, triage.targets) == ("tell", ["c1"])
+
+
+async def test_an_addition_about_nothing_under_way_goes_on_with_what_is_over():
+    active = [
+        commission("c1", "写一个整理发票的脚本", route="task_agent"),
+        commission("c4", "给博客换个主题", route="task_agent"),
+    ]
+    recent = [_over("c2", "整理下载文件夹里的照片")]
+
+    triage = await LexicalDecisionModel(FakeDecisionLLM()).triage(
+        request("另外照片按月份分文件夹", active=active, recent=recent, task_agent_available=True)
+    )
+
+    assert (triage.kind, triage.targets) == ("continue", ["c2"])
+
+
+@pytest.mark.parametrize(
+    "text, recent, kind",
+    [
+        # No word that says it adds something: a commission of its own, as before.
+        ("照片里的截图单独放一个文件夹", [("c1", "整理下载文件夹里的照片", {})], "new"),
+        # About something else.
+        ("另外把台灯关掉", [("c1", "整理下载文件夹里的照片", {})], "new"),
+        # Only a commission a task agent worked on, of her own, in a session, can be gone on with
+        # (the same sentence goes on with one that is all three: see the newest-of-several test).
+        ("另外照片按月份分文件夹", [("c1", "整理下载文件夹里的照片", {"route": "plugin"})], "new"),
+        ("另外照片按月份分文件夹", [("c1", "整理下载文件夹里的照片", {"parent_id": "c0"})], "new"),
+        ("另外照片按月份分文件夹", [("c1", "整理下载文件夹里的照片", {"session_id": None})], "new"),
+        # Nothing to go on with.
+        ("另外照片按月份分", [], "new"),
+        # One word in common is not enough, nor are words every request has.
+        ("also back up the notes to drive F:", [("c1", "sort the photos on drive E: as well", {})], "new"),
+        ("also remind me tomorrow", [("c1", "check the mail for me tomorrow morning", {})], "new"),
+    ],
+)
+async def test_a_sentence_that_is_no_follow_up_is_a_commission_of_its_own(text, recent, kind):
+    over = [_over(commission_id, dispatched, **values) for commission_id, dispatched, values in recent]
+
+    triage = await LexicalDecisionModel(FakeDecisionLLM()).triage(request(text, recent=over, task_agent_available=True))
+
+    assert (triage.kind, triage.targets) == (kind, [])
+
+
+async def test_nothing_is_gone_on_with_when_no_task_agent_can_be_started():
+    recent = [_over("c1", "整理下载文件夹里的照片")]
+
+    triage = await LexicalDecisionModel(FakeDecisionLLM()).triage(
+        request("另外照片按月份分文件夹", recent=recent, task_agent_available=False, plugins=weather_plugins())
+    )
+
+    assert triage.kind != "continue" and triage.targets == []
+
+
+async def test_of_several_that_share_as_much_the_newest_is_gone_on_with():
+    # Newest first, as the task brain hands them over.
+    recent = [_over("c3", "整理下载文件夹里的照片"), _over("c1", "整理下载文件夹里的照片")]
+
+    triage = await LexicalDecisionModel(FakeDecisionLLM()).triage(
+        request("另外照片按月份分文件夹", recent=recent, task_agent_available=True)
+    )
+
+    assert (triage.kind, triage.targets) == ("continue", ["c3"])
+
+
+@pytest.mark.parametrize(
+    "recent_ids, active, kind, targets",
+    [
+        # Nothing but "and also": about the one thing there was.
+        (["c1"], [], "continue", ["c1"]),
+        # Which of two, nobody can tell; and with something else under way it is not about what is over.
+        (["c1", "c2"], [], "new", []),
+        (["c1"], [("c5", "写一个整理发票的脚本"), ("c6", "给博客换个主题")], "new", []),
+    ],
+)
+async def test_a_sentence_that_only_says_it_adds_something(recent_ids, active, kind, targets):
+    recent = [_over(commission_id, "整理下载文件夹里的照片") for commission_id in recent_ids]
+    under_way = [commission(commission_id, text, route="task_agent") for commission_id, text in active]
+
+    triage = await LexicalDecisionModel(FakeDecisionLLM()).triage(
+        request("对了", active=under_way, recent=recent, task_agent_available=True)
+    )
+
+    assert (triage.kind, triage.targets) == (kind, targets)
+
+
+async def test_a_follow_up_takes_along_the_plugins_its_words_point_at():
+    recent = [_over("c1", "整理下载文件夹里的照片")]
+    llm = FakeDecisionLLM()
+
+    triage = await LexicalDecisionModel(llm).triage(
+        request("另外照片整理完查一下天气", recent=recent, task_agent_available=True)
+    )
+
+    assert (triage.kind, triage.targets) == ("continue", ["c1"])
+    assert "weather" in triage.candidate_ids and "weather" in triage.keyword_hit_ids
+    assert llm.calls == []
+
+
 async def test_answer_to_a_waiting_commission_is_read_locally():
     question = json.dumps({"kind": "questions", "questions": [{"id": "q1", "question": "照片按月份还是按地点分？"}]})
     active = [commission("c1", "整理下载文件夹里的照片", route="task_agent", status="waiting_user", pending_question=question)]
@@ -347,7 +487,17 @@ async def test_answer_to_a_waiting_commission_is_read_locally():
 
 @pytest.mark.parametrize(
     "text, choice",
-    [("可以", "once"), ("就这一次", "once"), ("以后都行", "always"), ("不行", "deny"), ("yes go ahead", "once"), ("always", "always"), ("no", "deny")],
+    [
+        ("可以", "once"),
+        ("就这一次", "once"),
+        ("以后都行", "always"),
+        ("这次任务里都可以", "session"),
+        ("不行", "deny"),
+        ("yes go ahead", "once"),
+        ("always", "always"),
+        ("fine for this session", "session"),
+        ("no", "deny"),
+    ],
 )
 async def test_answer_to_a_permission_prompt_carries_the_choice(text, choice):
     question = json.dumps({"kind": "permission", "category": "run_command", "detail": {"command": "dir"}})
@@ -397,6 +547,47 @@ async def test_unrelated_sentence_is_not_taken_as_an_answer():
     ],
 )
 def test_permission_answers(text, expected):
+    assert parse_permission_choice(text) == expected
+
+
+@pytest.mark.parametrize("lang", LANGUAGES)
+def test_each_named_answer_to_a_permission_prompt_reads_back_as_itself(lang):
+    # The four answers are named to her in the question; said back word for
+    # word, each has to be read as the choice it names.
+    from config.prompts.prompts_nekoclaw_brain import PERMISSION_OPTION_NAMES
+    from nekoclaw.host.permissions import CHOICES
+
+    names = PERMISSION_OPTION_NAMES[lang]
+
+    assert set(names) == set(CHOICES) == {"always", "session", "once", "deny"}
+    assert {choice: parse_permission_choice(name) for choice, name in names.items()} == {
+        choice: choice for choice in names
+    }
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # The scope has to be said outright to count as "for this session".
+        ("本会话都可以", "session"),
+        ("这个任务里都行", "session"),
+        ("for this task, always fine", "session"),
+        ("sure, during this task", "session"),
+        ("このセッション中は許可", "session"),
+        ("이번 세션 동안 허용", "session"),
+        ("разрешаю на эту сессию", "session"),
+        ("durante esta tarea, sí", "session"),
+        ("durante esta tarefa, sim", "session"),
+        # "This task is fine" names no scope: it is a one-time approval.
+        ("这个任务可以", "once"),
+        ("this one is fine", "once"),
+        # A refusal wins over a scope named in the same sentence.
+        ("这个会话里也不行", "deny"),
+        ("not for this session", "deny"),
+        ("この件の間もだめ", "deny"),
+    ],
+)
+def test_session_scope_in_a_permission_answer(text, expected):
     assert parse_permission_choice(text) == expected
 
 
@@ -512,28 +703,67 @@ async def test_large_catalog_with_no_candidate_skips_the_fine_selection():
     assert (selection.route, selection.model_calls, selection.shown_plugin_ids) == ("task_agent", 1, [])
 
 
-async def test_an_answer_naming_an_unknown_entry_gets_one_correction_never_two():
-    wrong = pick_plugin("weather", "now")
-    llm = FakeDecisionLLM(fine=[wrong, wrong, wrong])
+@pytest.mark.parametrize(
+    ("wrong", "problem"),
+    [
+        (pick_plugin("weather", "now"), "entry_id 'now' does not exist in plugin 'weather'"),
+        (pick_plugin("wetter", "today"), "plugin_id 'wetter' is not available"),
+        ({"route": "plugin", "plugin_id": "weather"}, "entry_id is required for plugin 'weather'"),
+        ({"route": "plugin", "entry_id": "today"}, "plugin_id is required"),
+    ],
+    ids=["unknown-entry", "unknown-plugin", "no-entry", "no-plugin"],
+)
+async def test_an_answer_naming_what_does_not_exist_is_not_asked_about_again(wrong, problem):
+    # The second answer would be right; it is never asked for.
+    llm = FakeDecisionLLM(fine=[wrong, pick_plugin("weather", "today")])
     model = LexicalDecisionModel(llm)
-    req = request("查一下上海明天的天气", task_agent_available=True)
 
-    selection = await model.select(req, Triage(kind="new"))
+    selection = await model.select(request("查一下上海明天的天气", task_agent_available=True), Triage(kind="new"))
 
-    assert llm.tiers() == ["fine", "fine"]
-    assert selection.model_calls == 2
-    # Still wrong after the correction: no plugin is called; a task agent takes it.
-    assert (selection.route, selection.plugin_id) == ("task_agent", None)
-    assert "CORRECTION" in llm.last("fine")[-1]["content"]
+    assert llm.tiers() == ["fine"]
+    assert selection.model_calls == 1
+    # No plugin is called on a guess; a task agent takes it, with what was shown.
+    assert (selection.route, selection.plugin_id, selection.entry_id) == ("task_agent", None, None)
+    assert problem in selection.reason
+    assert selection.shown_plugin_ids
 
 
-async def test_a_corrected_answer_is_used():
+async def test_an_answer_naming_what_does_not_exist_cannot_be_done_without_a_task_agent():
     llm = FakeDecisionLLM(fine=[pick_plugin("weather", "now"), pick_plugin("weather", "today")])
     model = LexicalDecisionModel(llm)
 
-    selection = await model.select(request("查一下上海明天的天气"), Triage(kind="new"))
+    selection = await model.select(request("查一下上海明天的天气", task_agent_available=False), Triage(kind="new"))
 
-    assert (selection.route, selection.entry_id, selection.model_calls) == ("plugin", "today", 2)
+    assert llm.tiers() == ["fine"]
+    assert (selection.route, selection.plugin_id, selection.model_calls) == ("none", None, 1)
+
+
+@pytest.mark.parametrize("task_agent_available", [True, False])
+async def test_the_model_can_say_that_nothing_can_do_it(task_agent_available):
+    llm = FakeDecisionLLM(
+        fine=[{"route": "none", "task_description": "修水龙头", "preference": "以后别催", "reason": "needs hands"}]
+    )
+    model = LexicalDecisionModel(llm)
+
+    selection = await model.select(
+        request("帮我把厨房的水龙头修好", task_agent_available=task_agent_available), Triage(kind="new")
+    )
+
+    # Nothing is started, whether or not a task agent could have been.
+    assert (selection.route, selection.plugin_id, selection.model_calls) == ("none", None, 1)
+    assert (selection.task_description, selection.reason) == ("修水龙头", "needs hands")
+    # What she stated for good is kept even when the task itself cannot be done.
+    assert selection.preference == "以后别催"
+
+
+async def test_an_answer_with_no_route_still_goes_to_a_task_agent():
+    # "none" has to be said; an answer that names no route is not read as it.
+    llm = FakeDecisionLLM(fine=[{"task_description": "整理桌面", "reason": ""}])
+    model = LexicalDecisionModel(llm)
+
+    selection = await model.select(request("整理一下桌面", task_agent_available=True), Triage(kind="new"))
+
+    assert (selection.route, selection.model_calls) == ("task_agent", 1)
 
 
 @pytest.mark.parametrize("answer", ["", "I cannot decide", RuntimeError("provider down")])
@@ -622,34 +852,69 @@ async def test_dispatch_text_user_text_and_preferences_are_capped_in_tokens():
     preferences = "\n".join(lines[lines.index("PREFERENCES:") + 1 :])
     assert count_tokens(task[len("TASK: ") :]) <= DISPATCH_TEXT_MAX_TOKENS
     assert count_tokens(said[len("USER_SAID: ") :]) <= DISPATCH_USER_TEXT_MAX_TOKENS
-    assert count_tokens(preferences) <= PREFERENCE_PROMPT_MAX_TOKENS == 150
+    assert count_tokens(preferences) <= PREFERENCE_PROMPT_MAX_TOKENS == 300
+    # What the owner agreed to (2026-11-18): with all three at their caps the fine selection
+    # is sent 1700 tokens of them, 950 more than before.
+    assert (DISPATCH_TEXT_MAX_TOKENS, DISPATCH_USER_TEXT_MAX_TOKENS) == (600, 800)
 
 
-@pytest.mark.parametrize("lang", ["zh", "zh-TW", "en", "ja", "ko", "ru", "es", "pt"])
-def test_fixed_part_of_the_fine_selection_is_no_longer_than_the_analyzers(lang):
-    from config.prompts.prompts_agent import USER_PLUGIN_SYSTEM_PROMPT
+# What the fixed part of the analyzer's selection prompt cost, per language,
+# measured on the text as it was when the analyzer was removed.
+ANALYZER_SELECTION_FIXED_TOKENS = {
+    "zh": 636, "zh-TW": 788, "en": 614, "ja": 938, "ko": 800, "ru": 830, "es": 690, "pt": 700,
+}
+
+
+@pytest.mark.parametrize("lang", LANGUAGES)
+def test_fixed_part_of_the_fine_selection_is_no_longer_than_the_analyzers_was(lang):
     from config.prompts.prompts_nekoclaw_brain import TASK_BRAIN_SELECT_PROMPT
     from utils.tokenize import count_tokens
 
     new = count_tokens(TASK_BRAIN_SELECT_PROMPT[lang].format(plugins_desc=""))
-    old = count_tokens(USER_PLUGIN_SYSTEM_PROMPT[lang].format(plugins_desc=""))
 
-    assert new <= old, f"{lang}: {new} tokens against the analyzer's {old}"
+    assert new <= ANALYZER_SELECTION_FIXED_TOKENS[lang], f"{lang}: {new} tokens"
 
 
-@pytest.mark.parametrize("lang", ["zh", "zh-TW", "en", "ja", "ko", "ru", "es", "pt"])
-def test_every_language_of_the_fine_selection_opens_as_the_analyzers_do(lang):
-    from config.prompts.prompts_agent import USER_PLUGIN_COARSE_SCREEN_PROMPT, USER_PLUGIN_SYSTEM_PROMPT
-    from config.prompts.prompts_nekoclaw_brain import TASK_BRAIN_SELECT_PROMPT
+@pytest.mark.parametrize("lang", LANGUAGES)
+@pytest.mark.parametrize(
+    "table", ["TASK_BRAIN_SELECT_PROMPT", "TASK_BRAIN_COARSE_SCREEN_PROMPT", "TURN_CHECK_PROMPT"]
+)
+def test_every_system_prompt_of_the_task_brain_opens_as_the_analyzers_did(table, lang):
+    from config.prompts import prompts_nekoclaw_brain
 
-    # The phrase the analyzer's prompts open with in every language, untranslated;
+    # The phrase the analyzer's prompts opened with in every language, untranslated;
     # the paired block markers of the other prompts would do as well.
     phrase = "automation assessment agent"
-    assert phrase in USER_PLUGIN_SYSTEM_PROMPT[lang].splitlines()[0]
-    assert phrase in USER_PLUGIN_COARSE_SCREEN_PROMPT[lang].splitlines()[0]
+    prompts = getattr(prompts_nekoclaw_brain, table)
 
-    text = TASK_BRAIN_SELECT_PROMPT[lang]
+    assert set(prompts) == set(LANGUAGES)
+    text = prompts[lang]
     assert phrase in text.splitlines()[0] or ("======以下为" in text and "======以上为" in text)
+
+
+def test_every_prompt_table_sent_to_a_model_is_under_that_check():
+    # A system prompt added to this file later has to be added to the test
+    # above; this fails until it is.
+    from config.prompts import prompts_nekoclaw_brain
+
+    sent_to_a_model = {
+        name for name in dir(prompts_nekoclaw_brain) if name.endswith("_PROMPT") and name.isupper()
+    }
+
+    assert sent_to_a_model == {
+        "TASK_BRAIN_SELECT_PROMPT",
+        "TASK_BRAIN_COARSE_SCREEN_PROMPT",
+        "TURN_CHECK_PROMPT",
+        "PLUGIN_SHORT_DESCRIPTION_SYSTEM_PROMPT",
+    }
+
+
+def test_the_short_description_prompt_opens_as_the_analyzers_did():
+    # One text for every language (the summary is read by the model only),
+    # under the same check as the tables above.
+    from config.prompts.prompts_nekoclaw_brain import PLUGIN_SHORT_DESCRIPTION_SYSTEM_PROMPT
+
+    assert "automation assessment agent" in PLUGIN_SHORT_DESCRIPTION_SYSTEM_PROMPT.splitlines()[0]
 
 
 def test_every_language_of_the_fine_selection_keeps_the_identifiers_it_parses():
@@ -663,6 +928,8 @@ def test_every_language_of_the_fine_selection_keeps_the_identifiers_it_parses():
             'route="plugin"',
             'route="task_agent"',
             'route="duplicate"',
+            'route="none"',
+            '"route": "plugin" | "task_agent" | "duplicate" | "none"',
             '"plugin_id"',
             '"entry_id"',
             '"plugin_args"',
@@ -675,6 +942,45 @@ def test_every_language_of_the_fine_selection_keeps_the_identifiers_it_parses():
             "[KEYWORD MATCH]",
         ):
             assert needle in rendered, f"{lang} lacks {needle}"
+        # The rule for "none" ends by sending a doubtful case to a task agent,
+        # and the rule before it says what a task agent can do.
+        none_rule = next(line for line in rendered.splitlines() if 'route="none"' in line)
+        assert none_rule.startswith("4. ") and none_rule.count("task_agent") >= 2, lang
+        agent_rule = next(line for line in rendered.splitlines() if line.startswith("3. "))
+        assert 'route="task_agent"' in agent_rule and agent_rule.count("task_agent") == 2, lang
+
+
+@pytest.mark.parametrize("text", ["可以", "yes", "okay", "不要", "no", "算了"])
+def test_a_plain_yes_or_no_answers_a_plugins_request_for_confirmation(text):
+    # It shares no word with the question and carries no "reply:" in front.
+    question = json.dumps({"kind": "confirmation", "question": "真的要删掉 3 条备忘吗？"}, ensure_ascii=False)
+    waiting = commission("c1", "清理备忘", route="task_agent", status="waiting_user", pending_question=question)
+
+    triage = read_answer(text, [waiting])
+
+    # The words go back as they are; a choice is only read for a permission.
+    assert triage is not None
+    assert (triage.kind, triage.targets, triage.choice) == ("answer", ["c1"], None)
+
+
+def test_a_plain_yes_does_not_answer_a_question_that_asks_for_something_else():
+    question = json.dumps({"kind": "report", "question": "订几点的？"}, ensure_ascii=False)
+    waiting = commission("c1", "订餐厅", route="task_agent", status="waiting_user", pending_question=question)
+
+    assert read_answer("可以", [waiting]) is None
+
+
+def test_a_yes_goes_to_the_one_question_it_can_answer():
+    asks_time = json.dumps({"kind": "report", "question": "订几点的？"}, ensure_ascii=False)
+    asks_yes = json.dumps({"kind": "confirmation", "question": "真的要删掉 3 条备忘吗？"}, ensure_ascii=False)
+    active = [
+        commission("c1", "订餐厅", route="task_agent", status="waiting_user", pending_question=asks_time),
+        commission("c2", "清理备忘", route="task_agent", status="waiting_user", pending_question=asks_yes),
+    ]
+
+    triage = read_answer("可以", active)
+
+    assert triage is not None and (triage.kind, triage.targets) == ("answer", ["c2"])
 
 
 # ---------------------------------------------------------------------------
@@ -896,3 +1202,92 @@ async def test_probe_for_a_query_agrees_with_a_dispatch_where_no_model_is_needed
 
     assert for_query.kind == for_dispatch.kind == kind
     assert llm.calls == []
+
+
+
+# ---------------------------------------------------------------------------
+# Turn check: the gate and the one model call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "score, text, expected",
+    [
+        # No score, or one at the threshold or above: the turn goes through.
+        (None, "今天好累啊", True),
+        (0.2, "今天好累啊", True),
+        (0.9, "帮我订一张机票", True),
+        # A low score, but a plugin keyword in the user's words.
+        (0.0, "明天天气怎么样", True),
+        # A low score and nothing local that speaks for a task.
+        (0.0, "今天好累啊", False),
+        (0.19, "讲个笑话", False),
+    ],
+)
+def test_gate_before_the_turn_check(score, text, expected):
+    from nekoclaw.host.decision import looks_like_a_task
+
+    plugins = [plugin("weather", "Weather lookups", [entry("today", "Today")], keywords=["天气", "weather"])]
+
+    assert looks_like_a_task(score, text, plugins) is expected
+
+
+def test_gate_lets_a_turn_through_when_a_plugin_has_no_keywords_to_match_by():
+    from nekoclaw.host.decision import looks_like_a_task
+
+    # Only a model can tell whether such a plugin fits, so its presence
+    # never holds a turn back; a passive or fully hidden one does not count.
+    without_keywords = [plugin("lamp", "Controls the desk lamp", [entry("switch", "Turn the lamp on or off")])]
+    hidden = [plugin("lamp", "Controls the desk lamp", [entry("switch", "Switch", metadata={"agent_hidden": True})])]
+
+    assert looks_like_a_task(0.0, "今天好累啊", without_keywords) is True
+    assert looks_like_a_task(0.0, "今天好累啊", hidden) is False
+
+
+@pytest.mark.parametrize(
+    "answer, kind, task",
+    [
+        ({"verdict": "promised", "task": "查上海明天的天气"}, "promised", "查上海明天的天气"),
+        ({"verdict": "unable", "task": "开灯"}, "unable", "开灯"),
+        ({"verdict": "claimed_done", "task": "订机票"}, "claimed_done", "订机票"),
+        ({"verdict": "none", "task": "不该留下的话"}, "none", ""),
+        ('```json\n{"verdict": "PROMISED", "task": " 查  天气 "}\n```', "promised", "查 天气"),
+        # Anything unreadable changes nothing.
+        ({"verdict": "maybe"}, "none", ""),
+        ("no json here", "none", ""),
+        (RuntimeError("boom"), "none", ""),
+    ],
+)
+async def test_turn_check_is_one_call_of_the_small_model(answer, kind, task):
+    llm = FakeDecisionLLM(turn=[answer])
+
+    verdict = await LexicalDecisionModel(llm).judge_turn("帮我查一下上海明天的天气", "好的，我这就去查", "zh")
+
+    assert llm.tiers() == ["turn_check"]
+    assert (verdict.kind, verdict.task, verdict.model_calls) == (kind, task, 1)
+
+
+@pytest.mark.parametrize("lang", LANGUAGES)
+async def test_turn_check_request_is_the_prompt_and_the_two_sentences(lang):
+    from config.prompts.prompts_nekoclaw_brain import TURN_CHECK_PROMPT, TURN_CHECK_VERDICTS
+
+    llm = FakeDecisionLLM(turn=[{"verdict": "none"}])
+
+    await LexicalDecisionModel(llm).judge_turn("USER-SENTENCE", "REPLY-SENTENCE", lang)
+
+    system, user = llm.last("turn_check")
+    assert system == {"role": "system", "content": TURN_CHECK_PROMPT[lang]}
+    assert user == {"role": "user", "content": "USER: USER-SENTENCE\nREPLY: REPLY-SENTENCE"}
+    # The identifiers the answer is parsed by are in the prompt of every language.
+    for needle in (*TURN_CHECK_VERDICTS, '"verdict"', '"task"'):
+        assert needle in system["content"], f"{lang}: {needle} missing"
+
+
+@pytest.mark.parametrize("lang", LANGUAGES)
+def test_fixed_part_of_the_turn_check_stays_small(lang):
+    from config.prompts.prompts_nekoclaw_brain import TURN_CHECK_PROMPT
+    from utils.tokenize import count_tokens
+
+    # With both sentences capped at 300 tokens each, one check stays below
+    # 950 tokens of input; a usual one is around 0.4k.
+    assert count_tokens(TURN_CHECK_PROMPT[lang]) <= 340
